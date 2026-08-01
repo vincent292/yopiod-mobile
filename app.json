@@ -1,0 +1,65 @@
+{
+  "expo": {
+    "name": "yopido.shop",
+    "slug": "yopido-shop",
+    "scheme": "yopido",
+    "version": "1.1.9",
+    "orientation": "portrait",
+    "icon": "./assets/yopido-icon-dark-1024.png",
+    "backgroundColor": "#12355B",
+    "primaryColor": "#12355B",
+    "userInterfaceStyle": "light",
+    "ios": {
+      "supportsTablet": true
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#12355B",
+        "foregroundImage": "./assets/yopido-icon-dark-1024.png",
+        "monochromeImage": "./assets/yopido-icon-dark-1024.png"
+      },
+      "package": "shop.yopido.app",
+      "googleServicesFile": "./android/app/google-services.json",
+      "permissions": [
+        "android.permission.ACCESS_COARSE_LOCATION",
+        "android.permission.ACCESS_FINE_LOCATION",
+        "android.permission.POST_NOTIFICATIONS"
+      ],
+      "predictiveBackGestureEnabled": true,
+      "versionCode": 11
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      [
+        "react-native-maps",
+        {}
+      ],
+      [
+        "expo-notifications",
+        {
+          "color": "#B7FF00",
+          "defaultChannel": "order-status",
+          "icon": "./assets/yopido-notification-icon.png"
+        }
+      ],
+      "expo-secure-store",
+      [
+        "expo-splash-screen",
+        {
+          "backgroundColor": "#12355B",
+          "image": "./assets/yopido-icon-dark-1024.png",
+          "imageWidth": 148,
+          "resizeMode": "contain"
+        }
+      ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "ec07ea77-ce7e-4a51-9aa5-7adcf1181776"
+      }
+    },
+    "owner": "vins-dev"
+  }
+}
