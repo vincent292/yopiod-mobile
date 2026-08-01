@@ -43,7 +43,7 @@ tmp/
 .env*.local
 
 # local credentials
-google-services*.json
+# google-services.json is the Firebase Android client config required by EAS Build.
 *firebase-adminsdk*.json
 *service-account*.json
 *fcm*.json

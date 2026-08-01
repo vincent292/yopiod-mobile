@@ -3,5 +3,5 @@
   "compilerOptions": {
     "strict": true
   },
-  "exclude": ["app"]
+  "exclude": ["app", "tmp"]
 }
