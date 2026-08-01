@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "665854788816",
+    "project_id": "yopido-shop",
+    "storage_bucket": "yopido-shop.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:665854788816:android:efeb41946bbb817acecad5",
+        "android_client_info": {
+          "package_name": "shop.yopido.app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyB371A41i8RgW45lJ_jeFC1Shrx-M5iJB0"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
