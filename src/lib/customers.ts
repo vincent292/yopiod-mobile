@@ -1,6 +1,24 @@
 import { config } from "./config";
 import type { RecentOrder, SavedAddress, SavedFavorite } from "./customer-store";
 
+const customerApiTimeoutMs = 20000;
+
+class CustomerApiError extends Error {
+  code: string;
+  status?: number;
+  url?: string;
+  causeMessage?: string;
+
+  constructor(code: string, options: { causeMessage?: string; status?: number; url?: string } = {}) {
+    super(code);
+    this.name = "CustomerApiError";
+    this.code = code;
+    this.status = options.status;
+    this.url = options.url;
+    this.causeMessage = options.causeMessage;
+  }
+}
+
 export type MobileCustomerProfile = {
   id: string;
   fullName: string;
@@ -52,21 +70,71 @@ type CustomerAccountPayload = {
 };
 
 function apiUrl(path: string) {
-  if (!config.apiBaseUrl) throw new Error("api-base-url-required");
+  if (!config.apiBaseUrl) throw new CustomerApiError("api-base-url-required");
   return `${config.apiBaseUrl.replace(/\/$/, "")}${path}`;
 }
 
-async function parseApiError(response: Response) {
-  const data = await response.json().catch(() => null);
-  if (response.status === 404) {
-    throw new Error("customer-api-not-deployed");
+function errorCodeFromBody(data: unknown, fallback: string) {
+  if (data && typeof data === "object" && "error" in data) {
+    const error = (data as { error?: unknown }).error;
+    if (typeof error === "string" && error.trim()) return error;
   }
-  const error = typeof data?.error === "string" ? data.error : "customer-api-failed";
-  throw new Error(error);
+
+  return fallback;
+}
+
+async function parseJsonResponse(response: Response) {
+  const text = await response.text().catch(() => "");
+  if (!text) return null;
+
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return null;
+  }
+}
+
+async function customerApi<T>(path: string, init: RequestInit, fallbackCode = "customer-api-failed"): Promise<T> {
+  const url = apiUrl(path);
+  const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+  const timeout = controller
+    ? setTimeout(() => {
+        controller.abort();
+      }, customerApiTimeoutMs)
+    : null;
+
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      ...init,
+      signal: controller?.signal,
+    });
+  } catch (error) {
+    const isAbort = error instanceof Error && error.name === "AbortError";
+    throw new CustomerApiError(isAbort ? "api-timeout" : "api-network-failed", {
+      causeMessage: error instanceof Error ? error.message : String(error),
+      url,
+    });
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+
+  const data = await parseJsonResponse(response);
+
+  if (!response.ok) {
+    const code = response.status === 404 && !errorCodeFromBody(data, "")
+      ? "customer-api-not-deployed"
+      : errorCodeFromBody(data, fallbackCode);
+    throw new CustomerApiError(code, { status: response.status, url });
+  }
+
+  return data as T;
 }
 
 export function customerErrorMessage(error: unknown) {
-  const message = error instanceof Error ? error.message : "customer-api-failed";
+  const message = error instanceof CustomerApiError ? error.code : error instanceof Error ? error.message : "customer-api-failed";
+  if (message === "api-network-failed") return "No pudimos conectar con la web. Si el APK apunta a una web local o a un puerto, recompila usando una URL accesible desde el celular.";
+  if (message === "api-timeout") return "La web tardo demasiado en responder. Intenta nuevamente en unos segundos.";
   if (message === "phone-already-exists") return "Ese telefono ya esta registrado en otra cuenta.";
   if (message === "document-already-exists") return "Ese carnet ya esta registrado en otra cuenta.";
   if (message === "email-already-exists") return "Ese correo ya esta registrado.";
@@ -74,12 +142,18 @@ export function customerErrorMessage(error: unknown) {
   if (message === "service-role-required") return "La web necesita SUPABASE_SERVICE_ROLE_KEY para registrar clientes.";
   if (message === "customer-api-not-deployed") return "La web publica todavia no tiene desplegada la API de clientes. Espera el deploy y vuelve a intentar.";
   if (message === "api-base-url-required") return "Configura EXPO_PUBLIC_API_BASE_URL para conectar con la web.";
+  if (message === "unauthorized") return "Tu sesion vencio. Cierra sesion e ingresa nuevamente.";
+  if (message === "email-required") return "Tu cuenta no tiene correo confirmado. Ingresa nuevamente o usa otro correo.";
+  if (message === "invalid-json") return "La app y la web tienen versiones distintas. Actualiza el APK o despliega la web mas reciente.";
+  if (message === "customer-auth-create-failed") return "Supabase no pudo crear la cuenta. Revisa Auth en la web o intenta con otro correo.";
+  if (message === "customer-save-failed") return "La web no pudo guardar tus datos. Revisa que la base de datos tenga las migraciones de clientes aplicadas.";
   if (message === "invalid-customer-registration") return "Revisa nombre, telefono, carnet, correo y contrasena.";
   if (message === "invalid-customer-profile") return "Revisa nombre, telefono y carnet.";
   if (message === "invalid-customer-address") return "Marca una direccion valida en el mapa.";
+  if (message === "address-save-failed") return "No pudimos guardar la direccion. Revisa la referencia e intenta nuevamente.";
   if (message === "invalid-customer-favorite" || message === "favorite-save-failed") return "No pudimos guardar el favorito. Intenta nuevamente.";
   if (message === "favorite-restaurant-not-found" || message === "favorite-product-not-found") return "Este local o plato ya no esta disponible.";
-  return "No se pudo completar la accion. Intenta nuevamente.";
+  return `No se pudo completar la accion (${message}). Intenta nuevamente.`;
 }
 
 export async function registerCustomerAccount(input: {
@@ -89,38 +163,29 @@ export async function registerCustomerAccount(input: {
   phone: string;
   documentNumber: string;
 }) {
-  const response = await fetch(apiUrl("/api/mobile/customers/register"), {
+  return customerApi<{ profile: MobileCustomerProfile }>("/api/mobile/customers/register", {
     body: JSON.stringify(input),
     headers: { "Content-Type": "application/json" },
     method: "POST",
   });
-
-  if (!response.ok) await parseApiError(response);
-  return (await response.json()) as { profile: MobileCustomerProfile };
 }
 
 export async function fetchCustomerAccount(accessToken: string): Promise<CustomerAccountPayload> {
-  const response = await fetch(apiUrl("/api/mobile/customers/profile"), {
+  return customerApi<CustomerAccountPayload>("/api/mobile/customers/profile", {
     headers: { Authorization: `Bearer ${accessToken}` },
     method: "GET",
   });
-
-  if (!response.ok) await parseApiError(response);
-  return (await response.json()) as CustomerAccountPayload;
 }
 
 export async function claimCustomerOrders(
   accessToken: string,
   orders: Array<{ orderId: string; trackingToken: string }>,
 ) {
-  const response = await fetch(apiUrl("/api/mobile/customers/orders/claim"), {
+  return customerApi<{ claimed: number; orderIds: string[] }>("/api/mobile/customers/orders/claim", {
     body: JSON.stringify({ orders }),
     headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
     method: "POST",
   });
-
-  if (!response.ok) await parseApiError(response);
-  return (await response.json()) as { claimed: number; orderIds: string[] };
 }
 
 export async function updateCustomerProfile(
@@ -131,14 +196,11 @@ export async function updateCustomerProfile(
     documentNumber: string;
   },
 ) {
-  const response = await fetch(apiUrl("/api/mobile/customers/profile"), {
+  return customerApi<{ profile: MobileCustomerProfile }>("/api/mobile/customers/profile", {
     body: JSON.stringify(input),
     headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
     method: "PUT",
   });
-
-  if (!response.ok) await parseApiError(response);
-  return (await response.json()) as { profile: MobileCustomerProfile };
 }
 
 export async function createCustomerAddress(
@@ -156,14 +218,11 @@ export async function createCustomerAddress(
     isDefault?: boolean;
   },
 ) {
-  const response = await fetch(apiUrl("/api/mobile/customers/addresses"), {
+  return customerApi<{ addresses: MobileCustomerAddress[] }>("/api/mobile/customers/addresses", {
     body: JSON.stringify(input),
     headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
     method: "POST",
   });
-
-  if (!response.ok) await parseApiError(response);
-  return (await response.json()) as { addresses: MobileCustomerAddress[] };
 }
 
 export async function setCustomerFavorite(
@@ -175,14 +234,11 @@ export async function setCustomerFavorite(
     favorite: boolean;
   },
 ) {
-  const response = await fetch(apiUrl("/api/mobile/customers/favorites"), {
+  return customerApi<{ favorites: SavedFavorite[] }>("/api/mobile/customers/favorites", {
     body: JSON.stringify(input),
     headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
     method: "PUT",
   });
-
-  if (!response.ok) await parseApiError(response);
-  return (await response.json()) as { favorites: SavedFavorite[] };
 }
 
 export function mapCustomerAddressToSavedAddress(address: MobileCustomerAddress): SavedAddress {

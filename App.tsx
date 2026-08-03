@@ -2212,7 +2212,7 @@ function AccountScreen({
     setErrorMessage("");
     setSuccessMessage("");
 
-    const cleanEmail = email.trim();
+    const cleanEmail = email.trim().toLowerCase();
     const cleanName = name.trim();
     const cleanPhone = phone.trim();
     const cleanDocumentNumber = documentNumber.trim();
