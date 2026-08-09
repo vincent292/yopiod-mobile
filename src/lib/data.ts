@@ -1,145 +1,45 @@
-import { distanceInKm } from "./distance";
 import { readCache, writeCache } from "./cache";
-import { supabase } from "./supabase";
-import type { BusinessHour, CategorySummary, HomeDirectory, PopularProductSummary, ProductOptionGroupSummary, ProductSummary, ProductVariantSummary, RestaurantSummary, UserLocation } from "../types/domain";
+import { config } from "./config";
+import { distanceInKm } from "./distance";
+import type { BusinessHour, CategorySummary, HomeDirectory, ProductSummary, RestaurantSummary, UserLocation } from "../types/domain";
 
-type RestaurantRow = {
-  id: string;
-  name: string;
-  slug: string;
-  description: string | null;
-  city: string | null;
-  address: string | null;
-  business_type: string | null;
-  logo_url: string | null;
-  banner_url: string | null;
-  latitude: number | null;
-  longitude: number | null;
-};
-
-type CategoryRow = {
-  id: string;
-  name: string;
-  description: string | null;
-};
-
-type ProductRow = {
-  id: string;
-  restaurant_id: string;
-  category_id: string | null;
-  name: string;
-  description: string | null;
-  price: number;
-  image_url: string | null;
-  is_featured: boolean | null;
-  sort_order: number | null;
-  order_count: number | null;
-};
-
-type VariantRow = {
-  id: string;
-  product_id: string;
-  name: string;
-  description: string | null;
-  price_delta: number;
-  sort_order: number | null;
-};
-
-type OptionGroupRow = {
-  id: string;
-  product_id: string;
-  name: string;
-  description: string | null;
-  min_choices: number;
-  max_choices: number;
-  is_required: boolean;
-  sort_order: number | null;
-};
-
-type OptionRow = {
-  id: string;
-  product_id: string;
-  option_group_id: string;
-  name: string;
-  description: string | null;
-  price_delta: number;
-  sort_order: number | null;
-};
-
-type BusinessHourRow = {
-  day_of_week: number;
-  opens_at: string | null;
-  closes_at: string | null;
-  is_closed: boolean | null;
-};
-
-type CountRow = {
-  restaurant_id: string;
-};
-
-type RestaurantMetrics = {
-  visits7d?: number;
-  orders30d?: number;
-  popularProducts?: string[];
-};
-
-function daysAgoIso(days: number) {
-  const date = new Date();
-  date.setDate(date.getDate() - days);
-  return date.toISOString();
-}
-
-function initials(name: string) {
-  return name
-    .split(/\s+/)
-    .slice(0, 2)
-    .map((part) => part[0])
-    .join("")
-    .toUpperCase();
-}
-
-function countByRestaurant(rows: CountRow[]) {
-  const counts = new Map<string, number>();
-  rows.forEach((row) => counts.set(row.restaurant_id, (counts.get(row.restaurant_id) ?? 0) + 1));
-  return counts;
-}
-
-function mapRestaurant(row: RestaurantRow, location?: UserLocation, metrics: RestaurantMetrics = {}): RestaurantSummary {
-  const hasCoordinates = row.latitude !== null && row.longitude !== null;
-  const distanceKm = location && hasCoordinates ? distanceInKm(location, { latitude: Number(row.latitude), longitude: Number(row.longitude) }) : undefined;
-
-  return {
-    id: row.id,
-    name: row.name,
-    slug: row.slug,
-    description: row.description ?? "Pide tus favoritos en minutos.",
-    city: row.city ?? "",
-    address: row.address ?? "",
-    businessType: row.business_type ?? "food",
-    logoUrl: row.logo_url ?? initials(row.name),
-    bannerUrl: row.banner_url ?? "",
-    latitude: row.latitude ?? undefined,
-    longitude: row.longitude ?? undefined,
-    distanceKm,
-    visits7d: metrics.visits7d ?? 0,
-    orders30d: metrics.orders30d ?? 0,
-    popularProducts: metrics.popularProducts ?? [],
+type RestaurantDetail = {
+  restaurant: RestaurantSummary;
+  businessHours: BusinessHour[];
+  catalog: {
+    categories: CategorySummary[];
+    products: ProductSummary[];
   };
+};
+
+const cacheTtlMs = 1000 * 60 * 60 * 6;
+const apiTimeoutMs = 20000;
+const restaurantDetails = new Map<string, { expiresAt: number; value: RestaurantDetail }>();
+const restaurantMemoryTtlMs = 15000;
+
+function apiUrl(path: string) {
+  if (!config.apiBaseUrl) throw new Error("api-base-url-required");
+  return `${config.apiBaseUrl.replace(/\/$/, "")}${path}`;
 }
 
-function emptyDirectory(): HomeDirectory {
-  return {
-    activeCity: "",
-    restaurants: [],
-    mostVisited: [],
-    mostOrderedRestaurants: [],
-    mostOrderedProducts: [],
-    productSuggestions: [],
-  };
-}
+async function mobileGet<T>(path: string): Promise<T> {
+  const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+  const timeout = controller ? setTimeout(() => controller.abort(), apiTimeoutMs) : null;
 
-function sortRestaurants(restaurants: RestaurantSummary[]) {
-  return [...restaurants].sort((first, second) => (first.distanceKm ?? Number.POSITIVE_INFINITY) - (second.distanceKm ?? Number.POSITIVE_INFINITY));
+  try {
+    const response = await fetch(apiUrl(path), {
+      headers: { Accept: "application/json" },
+      signal: controller?.signal,
+    });
+    const data = await response.json().catch(() => null);
+    if (!response.ok) {
+      const code = data && typeof data.error === "string" ? data.error : "mobile-data-failed";
+      throw new Error(code);
+    }
+    return data as T;
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
 }
 
 function normalizeCity(value?: string | null) {
@@ -150,14 +50,34 @@ function normalizeCity(value?: string | null) {
     .toLowerCase();
 }
 
-function nearestRestaurantCity(rows: RestaurantRow[], location?: UserLocation) {
+function absoluteMediaUrl(value: string) {
+  if (!value || !value.startsWith("/")) return value;
+  return `${config.apiBaseUrl.replace(/\/$/, "")}${value}`;
+}
+
+function withLocation(restaurant: RestaurantSummary, location?: UserLocation): RestaurantSummary {
+  const hasCoordinates = restaurant.latitude != null && restaurant.longitude != null;
+  return {
+    ...restaurant,
+    logoUrl: absoluteMediaUrl(restaurant.logoUrl),
+    bannerUrl: absoluteMediaUrl(restaurant.bannerUrl),
+    distanceKm: location && hasCoordinates
+      ? distanceInKm(location, { latitude: Number(restaurant.latitude), longitude: Number(restaurant.longitude) })
+      : undefined,
+  };
+}
+
+function sortRestaurants(restaurants: RestaurantSummary[]) {
+  return [...restaurants].sort((first, second) => (first.distanceKm ?? Number.POSITIVE_INFINITY) - (second.distanceKm ?? Number.POSITIVE_INFINITY));
+}
+
+function nearestRestaurantCity(restaurants: RestaurantSummary[], location?: UserLocation) {
   if (!location) return "";
 
   let nearestCity = "";
   let nearestDistance = Number.POSITIVE_INFINITY;
-
-  rows.forEach((restaurant) => {
-    if (restaurant.latitude === null || restaurant.longitude === null || !restaurant.city) return;
+  restaurants.forEach((restaurant) => {
+    if (restaurant.latitude == null || restaurant.longitude == null || !restaurant.city) return;
     const distance = distanceInKm(location, {
       latitude: Number(restaurant.latitude),
       longitude: Number(restaurant.longitude),
@@ -171,119 +91,51 @@ function nearestRestaurantCity(rows: RestaurantRow[], location?: UserLocation) {
   return nearestDistance <= 50 ? nearestCity : "";
 }
 
-const cacheTtlMs = 1000 * 60 * 60 * 6;
-
 function homeCacheKey(location?: UserLocation) {
   const city = normalizeCity(location?.city) || "all";
   const lat = location?.latitude != null ? location.latitude.toFixed(2) : "na";
   const lng = location?.longitude != null ? location.longitude.toFixed(2) : "na";
-  return `home:v2:${city}:${lat}:${lng}`;
+  return `home:v3:web-api:${city}:${lat}:${lng}`;
 }
 
 export async function listHomeDirectory(location?: UserLocation): Promise<HomeDirectory> {
   const cacheKey = homeCacheKey(location);
 
   try {
-    const { data, error } = await supabase
-      .from("restaurants")
-      .select("id,name,slug,description,city,address,business_type,logo_url,banner_url,latitude,longitude")
-      .eq("status", "active")
-      .is("deleted_at", null)
-      .order("created_at", { ascending: false });
-
-    if (error) {
-      throw new Error(error.message);
-    }
-
-    const restaurantRows = (data ?? []) as RestaurantRow[];
-    const restaurantIds = restaurantRows.map((restaurant) => restaurant.id);
-    if (!restaurantIds.length) {
-      const empty = emptyDirectory();
-      await writeCache(cacheKey, empty);
-      return empty;
-    }
-
-    const since7d = daysAgoIso(7);
-    const since30d = daysAgoIso(30);
-    const [productsResult, ordersResult, visitsResult] = await Promise.all([
-      supabase
-        .from("products")
-        .select("id,restaurant_id,category_id,name,description,price,image_url,is_featured,sort_order,order_count")
-        .in("restaurant_id", restaurantIds)
-        .eq("is_available", true),
-      supabase.from("orders").select("restaurant_id").in("restaurant_id", restaurantIds).gte("created_at", since30d),
-      supabase.from("restaurant_public_visits").select("restaurant_id").in("restaurant_id", restaurantIds).gte("visited_at", since7d),
-    ]);
-
-    const products = productsResult.error ? [] : ((productsResult.data ?? []) as ProductRow[]);
-    const ordersCount = ordersResult.error ? new Map<string, number>() : countByRestaurant((ordersResult.data ?? []) as CountRow[]);
-    const visitsCount = visitsResult.error ? new Map<string, number>() : countByRestaurant((visitsResult.data ?? []) as CountRow[]);
-    const productsByRestaurant = new Map<string, ProductRow[]>();
-    const restaurantById = new Map(restaurantRows.map((restaurant) => [restaurant.id, restaurant]));
-
-    products.forEach((product) => {
-      const current = productsByRestaurant.get(product.restaurant_id) ?? [];
-      current.push(product);
-      productsByRestaurant.set(product.restaurant_id, current);
-    });
-
+    const remote = await mobileGet<HomeDirectory>("/api/mobile/directory");
+    const allRestaurants = remote.restaurants.map((restaurant) => withLocation(restaurant, location));
     const requestedCity = normalizeCity(location?.city);
     const requestedCityRows = requestedCity
-      ? restaurantRows.filter((restaurant) => normalizeCity(restaurant.city) === requestedCity)
+      ? allRestaurants.filter((restaurant) => normalizeCity(restaurant.city) === requestedCity)
       : [];
     const activeCity = requestedCity
       ? requestedCityRows[0]?.city || location?.city || ""
-      : nearestRestaurantCity(restaurantRows, location);
+      : nearestRestaurantCity(allRestaurants, location);
     const activeCityFilter = normalizeCity(activeCity);
-    const visibleRestaurantRows = location
-      ? restaurantRows.filter((restaurant) => normalizeCity(restaurant.city) === activeCityFilter)
-      : restaurantRows;
-    const visibleRestaurantIds = new Set(visibleRestaurantRows.map((restaurant) => restaurant.id));
-    const visibleProducts = products.filter((product) => visibleRestaurantIds.has(product.restaurant_id));
+    const visibleRestaurants = location
+      ? allRestaurants.filter((restaurant) => normalizeCity(restaurant.city) === activeCityFilter)
+      : allRestaurants;
+    const visibleIds = new Set(visibleRestaurants.map((restaurant) => restaurant.id));
+    const byId = new Map(allRestaurants.map((restaurant) => [restaurant.id, restaurant]));
+    const visibleProducts = remote.productSuggestions
+      .filter((product) => visibleIds.has(product.restaurantId))
+      .map((product) => ({ ...product, imageUrl: absoluteMediaUrl(product.imageUrl) }));
+    const visibleRanked = (items: RestaurantSummary[]) => items
+      .filter((restaurant) => visibleIds.has(restaurant.id))
+      .map((restaurant) => byId.get(restaurant.id) ?? withLocation(restaurant, location));
 
-    const restaurants = sortRestaurants(
-      visibleRestaurantRows.map((restaurant) => {
-        const restaurantProducts = [...(productsByRestaurant.get(restaurant.id) ?? [])].sort((first, second) => Number(second.order_count ?? 0) - Number(first.order_count ?? 0));
-        return mapRestaurant(restaurant, location, {
-          orders30d: ordersCount.get(restaurant.id) ?? 0,
-          visits7d: visitsCount.get(restaurant.id) ?? 0,
-          popularProducts: restaurantProducts.slice(0, 3).map((product) => product.name),
-        });
-      }),
-    );
-
-    const productSuggestions = [...visibleProducts]
-      .sort((first, second) => Number(second.order_count ?? 0) - Number(first.order_count ?? 0))
-      .slice(0, 40)
-      .map<PopularProductSummary | null>((product) => {
-        const restaurant = restaurantById.get(product.restaurant_id);
-        if (!restaurant) return null;
-        return {
-          id: product.id,
-          restaurantId: restaurant.id,
-          restaurantName: restaurant.name,
-          restaurantSlug: restaurant.slug,
-          name: product.name,
-          description: product.description ?? "",
-          price: Number(product.price),
-          imageUrl: product.image_url ?? "",
-          orderCount: Number(product.order_count ?? 0),
-        };
-      })
-      .filter((product): product is PopularProductSummary => Boolean(product));
-
-    const directory = {
+    const directory: HomeDirectory = {
       activeCity,
-      restaurants,
-      mostVisited: [...restaurants].sort((first, second) => second.visits7d - first.visits7d).slice(0, 6),
-      mostOrderedRestaurants: [...restaurants].sort((first, second) => second.orders30d - first.orders30d).slice(0, 6),
-      mostOrderedProducts: productSuggestions.filter((product) => product.orderCount > 0).slice(0, 10),
-      productSuggestions,
+      restaurants: sortRestaurants(visibleRestaurants),
+      mostVisited: visibleRanked(remote.mostVisited),
+      mostOrderedRestaurants: visibleRanked(remote.mostOrderedRestaurants),
+      mostOrderedProducts: visibleProducts.filter((product) => product.orderCount > 0).slice(0, 12),
+      productSuggestions: visibleProducts,
     };
     await writeCache(cacheKey, directory);
     return directory;
   } catch (error) {
-    const cached = await readCache<HomeDirectory>(cacheKey);
+    const cached = await readCache<HomeDirectory>(cacheKey, cacheTtlMs);
     if (cached) return cached;
     throw error;
   }
@@ -293,166 +145,44 @@ export async function listRestaurants(location?: UserLocation) {
   return (await listHomeDirectory(location)).restaurants;
 }
 
-export async function getRestaurantBySlug(slug: string, location?: UserLocation) {
-  const { data, error } = await supabase
-    .from("restaurants")
-    .select("id,name,slug,description,city,address,business_type,logo_url,banner_url,latitude,longitude")
-    .eq("slug", slug)
-    .eq("status", "active")
-    .is("deleted_at", null)
-    .maybeSingle();
+async function getRestaurantDetail(slug: string) {
+  const memory = restaurantDetails.get(slug);
+  if (memory && memory.expiresAt > Date.now()) return memory.value;
 
-  if (error) {
-    throw new Error(error.message);
-  }
-
-  return data ? mapRestaurant(data as RestaurantRow, location) : null;
-}
-
-export async function listRestaurantBusinessHours(restaurantId: string): Promise<BusinessHour[]> {
-  const cacheKey = `business-hours:${restaurantId}`;
-
+  const cacheKey = `restaurant:v3:web-api:${slug}`;
   try {
-    const { data, error } = await supabase
-      .from("business_hours")
-      .select("day_of_week,opens_at,closes_at,is_closed")
-      .eq("restaurant_id", restaurantId)
-      .order("day_of_week", { ascending: true });
-
-    if (error) throw new Error(error.message);
-
-    const hours = ((data ?? []) as BusinessHourRow[]).map<BusinessHour>((hour) => ({
-      closesAt: hour.closes_at ?? "",
-      dayOfWeek: hour.day_of_week,
-      isClosed: Boolean(hour.is_closed),
-      opensAt: hour.opens_at ?? "",
-    }));
-    await writeCache(cacheKey, hours);
-    return hours;
-  } catch (error) {
-    const cached = await readCache<BusinessHour[]>(cacheKey, cacheTtlMs);
-    if (cached) return cached;
-    throw error;
-  }
-}
-
-export async function listRestaurantCatalog(restaurantId: string) {
-  const cacheKey = `catalog:${restaurantId}`;
-
-  try {
-    const [
-      { data: categories, error: categoryError },
-      { data: products, error: productError },
-      { data: variants },
-      { data: optionGroups },
-      { data: options },
-    ] = await Promise.all([
-      supabase
-        .from("categories")
-        .select("id,name,description")
-        .eq("restaurant_id", restaurantId)
-        .eq("is_active", true)
-        .order("sort_order", { ascending: true }),
-      supabase
-        .from("products")
-        .select("id,restaurant_id,category_id,name,description,price,image_url,is_featured,sort_order,order_count")
-        .eq("restaurant_id", restaurantId)
-        .eq("is_available", true)
-        .order("sort_order", { ascending: true }),
-      supabase
-        .from("product_variants")
-        .select("id,product_id,name,description,price_delta,sort_order")
-        .eq("restaurant_id", restaurantId)
-        .eq("is_active", true)
-        .order("sort_order", { ascending: true }),
-      supabase
-        .from("product_option_groups")
-        .select("id,product_id,name,description,min_choices,max_choices,is_required,sort_order")
-        .eq("restaurant_id", restaurantId)
-        .eq("is_active", true)
-        .order("sort_order", { ascending: true }),
-      supabase
-        .from("product_options")
-        .select("id,product_id,option_group_id,name,description,price_delta,sort_order")
-        .eq("restaurant_id", restaurantId)
-        .eq("is_active", true)
-        .order("sort_order", { ascending: true }),
-    ]);
-
-    if (categoryError) {
-      throw new Error(categoryError.message);
-    }
-
-    if (productError) {
-      throw new Error(productError.message);
-    }
-
-    const variantsByProduct = new Map<string, ProductVariantSummary[]>();
-    ((variants ?? []) as VariantRow[]).forEach((variant) => {
-      const current = variantsByProduct.get(variant.product_id) ?? [];
-      current.push({
-        id: variant.id,
-        name: variant.name,
-        description: variant.description ?? "",
-        priceDelta: Number(variant.price_delta),
-      });
-      variantsByProduct.set(variant.product_id, current);
-    });
-
-    const optionsByGroup = new Map<string, OptionRow[]>();
-    ((options ?? []) as OptionRow[]).forEach((option) => {
-      const current = optionsByGroup.get(option.option_group_id) ?? [];
-      current.push(option);
-      optionsByGroup.set(option.option_group_id, current);
-    });
-
-    const groupsByProduct = new Map<string, ProductOptionGroupSummary[]>();
-    ((optionGroups ?? []) as OptionGroupRow[]).forEach((group) => {
-      const current = groupsByProduct.get(group.product_id) ?? [];
-      current.push({
-        id: group.id,
-        name: group.name,
-        description: group.description ?? "",
-        minChoices: Number(group.min_choices),
-        maxChoices: Number(group.max_choices),
-        isRequired: Boolean(group.is_required),
-        options: (optionsByGroup.get(group.id) ?? []).map((option) => ({
-          id: option.id,
-          name: option.name,
-          description: option.description ?? "",
-          priceDelta: Number(option.price_delta),
+    const detail = await mobileGet<RestaurantDetail>(`/api/mobile/restaurants/${encodeURIComponent(slug)}`);
+    const normalized: RestaurantDetail = {
+      ...detail,
+      restaurant: withLocation(detail.restaurant),
+      catalog: {
+        ...detail.catalog,
+        products: detail.catalog.products.map((product) => ({
+          ...product,
+          imageUrl: absoluteMediaUrl(product.imageUrl),
         })),
-      });
-      groupsByProduct.set(group.product_id, current);
-    });
-
-    const catalog = {
-      categories: ((categories ?? []) as CategoryRow[]).map<CategorySummary>((category) => ({
-        id: category.id,
-        name: category.name,
-        description: category.description ?? "",
-      })),
-      products: ((products ?? []) as ProductRow[]).map<ProductSummary>((product) => ({
-        id: product.id,
-        categoryId: product.category_id ?? "",
-        name: product.name,
-        description: product.description ?? "",
-        price: Number(product.price),
-        imageUrl: product.image_url ?? "",
-        isFeatured: Boolean(product.is_featured),
-        orderCount: Number(product.order_count ?? 0),
-        variants: variantsByProduct.get(product.id) ?? [],
-        optionGroups: groupsByProduct.get(product.id) ?? [],
-      })),
+      },
     };
-    await writeCache(cacheKey, catalog);
-    return catalog;
+    restaurantDetails.set(slug, { expiresAt: Date.now() + restaurantMemoryTtlMs, value: normalized });
+    await writeCache(cacheKey, normalized);
+    return normalized;
   } catch (error) {
-    const cached = await readCache<{
-      categories: CategorySummary[];
-      products: ProductSummary[];
-    }>(cacheKey, cacheTtlMs);
+    const cached = await readCache<RestaurantDetail>(cacheKey, cacheTtlMs);
     if (cached) return cached;
+    if (error instanceof Error && error.message === "restaurant-not-found") return null;
     throw error;
   }
+}
+
+export async function getRestaurantBySlug(slug: string, location?: UserLocation) {
+  const detail = await getRestaurantDetail(slug);
+  return detail ? withLocation(detail.restaurant, location) : null;
+}
+
+export async function listRestaurantBusinessHours(restaurantSlug: string): Promise<BusinessHour[]> {
+  return (await getRestaurantDetail(restaurantSlug))?.businessHours ?? [];
+}
+
+export async function listRestaurantCatalog(restaurantSlug: string) {
+  return (await getRestaurantDetail(restaurantSlug))?.catalog ?? { categories: [], products: [] };
 }

@@ -75,7 +75,8 @@ import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 import { EmptyMessage, FadeInView, IconButton, colors } from "./src/components/ui";
 import { addRecentOrder, loadCustomerStore, saveCustomerStore, upsertSavedAddress } from "./src/lib/customer-store";
 import type { CustomerStore, RecentOrder, SavedAddress, SavedFavorite } from "./src/lib/customer-store";
-import { claimCustomerOrders, createCustomerAddress, customerErrorMessage, fetchCustomerAccount, mapCustomerAddressToSavedAddress, mapCustomerOrderToRecentOrder, registerCustomerAccount, setCustomerFavorite, updateCustomerProfile } from "./src/lib/customers";
+import { claimCustomerOrders, createCustomerAddress, customerErrorMessage, fetchCustomerAccount, mapCustomerAddressToSavedAddress, mapCustomerOrderToRecentOrder, registerCustomerAccount, setCustomerFavorite, signInCustomerAccount, updateCustomerProfile } from "./src/lib/customers";
+import { signInCustomerWithGoogle } from "./src/lib/auth";
 import { getRestaurantBySlug, listHomeDirectory, listRestaurantBusinessHours, listRestaurantCatalog } from "./src/lib/data";
 import { config } from "./src/lib/config";
 import { clearCache, readCacheEnvelope, writeCache } from "./src/lib/cache";
@@ -83,6 +84,18 @@ import { businessHoursSummary, getBusinessStatus } from "./src/lib/business-hour
 import { formatDistance } from "./src/lib/distance";
 import { createMobileOrder, getMobileApiError, getMobileOrderStatus, trackMobileOrder } from "./src/lib/orders";
 import type { MobileOrderQueueState, MobileOrderStatus, MobileOrderType, MobileTrackedOrder, MobileTrackingResult } from "./src/lib/orders";
+import {
+  addMobileGroupOrderItem,
+  createMobileGroupOrderSession,
+  getMobileGroupOrderSession,
+  groupOrderErrorMessage,
+  joinMobileGroupOrderSession,
+  removeMobileGroupOrderItem,
+  submitMobileGroupOrder,
+  updateMobileGroupHost,
+  updateMobileGroupParticipantPayment,
+} from "./src/lib/group-orders";
+import type { GroupCollectMode, GroupPaymentStatus, MobileGroupItem, MobileGroupOrderState, MobileGroupParticipant } from "./src/lib/group-orders";
 import { listenForOrderNotificationOpen, requestOrderNotificationRegistration, scheduleOrderNotificationTest } from "./src/lib/push";
 import type { LocalNotificationResult, PushRegistration, PushRegistrationResult } from "./src/lib/push";
 import { supabase } from "./src/lib/supabase";
@@ -91,6 +104,7 @@ import type { BusinessHour, CategorySummary, HomeDirectory, PopularProductSummar
 type Screen =
   | { name: "home" }
   | { name: "restaurant"; slug: string }
+  | { name: "group"; restaurantSlug: string; sessionToken?: string; hostAccessToken?: string; participantToken?: string }
   | { name: "orders"; orderId?: string; trackingToken?: string; orderNumber?: string; customerPhone?: string }
   | { name: "promos" }
   | { name: "account" };
@@ -623,6 +637,7 @@ function YopidoApp() {
           customerAccessToken={sessionUser?.accessToken}
           customerStore={customerStore}
           onBack={() => setScreen({ name: "home" })}
+          onOpenGroupOrder={(tokens) => setScreen({ name: "group", restaurantSlug: screen.slug, ...tokens })}
           onRecentOrder={handleRecentOrder}
           onSavedAddress={handleSavedAddress}
           onToggleFavorite={handleToggleFavorite}
@@ -642,6 +657,19 @@ function YopidoApp() {
           recentOrders={customerStore.recentOrders}
         />
       ) : null}
+      {screen.name === "group" ? (
+        <GroupOrderScreen
+          customerStore={customerStore}
+          hostAccessToken={screen.hostAccessToken}
+          onBack={() => setScreen({ name: "restaurant", slug: screen.restaurantSlug })}
+          onRecentOrder={handleRecentOrder}
+          onSavedAddress={handleSavedAddress}
+          onTrack={(order) => setScreen({ name: "orders", ...order })}
+          participantToken={screen.participantToken}
+          restaurantSlug={screen.restaurantSlug}
+          sessionToken={screen.sessionToken}
+        />
+      ) : null}
       {screen.name === "promos" ? <PromosScreen onOpenRestaurant={(slug) => setScreen({ name: "restaurant", slug })} /> : null}
       {screen.name === "account" ? (
         <AccountScreen
@@ -659,7 +687,7 @@ function YopidoApp() {
           sessionUser={sessionUser}
         />
       ) : null}
-      {screen.name !== "restaurant" && (screen.name !== "home" || activeLocation) ? <BottomNav active={screen.name} onNavigate={(name) => setScreen({ name } as Screen)} /> : null}
+      {screen.name !== "restaurant" && screen.name !== "group" && (screen.name !== "home" || activeLocation) ? <BottomNav active={screen.name} onNavigate={(name) => setScreen({ name } as Screen)} /> : null}
     </SafeAreaProvider>
   );
 }
@@ -1110,6 +1138,7 @@ function RestaurantScreen({
   customerAccessToken,
   customerStore,
   onBack,
+  onOpenGroupOrder,
   onRecentOrder,
   onSavedAddress,
   onToggleFavorite,
@@ -1120,6 +1149,7 @@ function RestaurantScreen({
   customerAccessToken?: string;
   customerStore: CustomerStore;
   onBack: () => void;
+  onOpenGroupOrder: (tokens?: { sessionToken?: string; hostAccessToken?: string; participantToken?: string }) => void;
   onRecentOrder: (order: RecentOrder) => void;
   onSavedAddress: (address: Omit<SavedAddress, "id" | "updatedAt">) => void;
   onToggleFavorite: (favorite: SavedFavorite) => void | Promise<void>;
@@ -1140,6 +1170,7 @@ function RestaurantScreen({
   const [cartOpen, setCartOpen] = useState(false);
   const [restaurantMenuOpen, setRestaurantMenuOpen] = useState(false);
   const [restaurantInfoOpen, setRestaurantInfoOpen] = useState(false);
+  const [groupStartOpen, setGroupStartOpen] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [cartCacheReady, setCartCacheReady] = useState(false);
@@ -1251,8 +1282,8 @@ function RestaurantScreen({
         return;
       }
       const [catalog, hours] = await Promise.all([
-        listRestaurantCatalog(nextRestaurant.id),
-        listRestaurantBusinessHours(nextRestaurant.id),
+        listRestaurantCatalog(nextRestaurant.slug),
+        listRestaurantBusinessHours(nextRestaurant.slug),
       ]);
       setRestaurant(nextRestaurant);
       setBusinessHours(hours);
@@ -1414,6 +1445,17 @@ function RestaurantScreen({
               </View>
             ) : null}
 
+            <Pressable onPress={() => setGroupStartOpen(true)} style={({ pressed }) => [styles.groupEntryCard, pressed && styles.pressedCard]}>
+              <View style={styles.groupEntryIcon}>
+                <UsersRound color={colors.blue} size={24} strokeWidth={3} />
+              </View>
+              <View style={styles.groupEntryBody}>
+                <Text style={styles.groupEntryTitle}>Yopido Grupal</Text>
+                <Text style={styles.groupEntryText}>Pidan entre amigos, cada uno agrega su parte y el host finaliza una sola orden.</Text>
+              </View>
+              <ArrowRight color={colors.blue} size={20} strokeWidth={3} />
+            </Pressable>
+
             <View style={styles.restaurantSearchShell}>
               <Search color={colors.muted} size={19} strokeWidth={3} />
               <TextInput
@@ -1525,8 +1567,749 @@ function RestaurantScreen({
         />
       ) : null}
       {restaurantInfoOpen ? <RestaurantInfoSheet onClose={() => setRestaurantInfoOpen(false)} onOpenMap={openRestaurantMap} restaurant={restaurant} /> : null}
+      {groupStartOpen ? (
+        <GroupOrderStartSheet
+          customerStore={customerStore}
+          onClose={() => setGroupStartOpen(false)}
+          onOpenGroup={(tokens) => {
+            setGroupStartOpen(false);
+            onOpenGroupOrder(tokens);
+          }}
+          restaurant={restaurant}
+        />
+      ) : null}
     </SafeAreaView>
   );
+}
+
+function GroupOrderStartSheet({
+  customerStore,
+  restaurant,
+  onClose,
+  onOpenGroup,
+}: {
+  customerStore: CustomerStore;
+  restaurant: RestaurantSummary;
+  onClose: () => void;
+  onOpenGroup: (tokens: { sessionToken: string; hostAccessToken?: string; participantToken?: string }) => void;
+}) {
+  const [mode, setMode] = useState<"create" | "join">("create");
+  const [hostName, setHostName] = useState(customerStore.profile.name);
+  const [hostPhone, setHostPhone] = useState(customerStore.profile.phone);
+  const [displayName, setDisplayName] = useState(customerStore.profile.name);
+  const [phone, setPhone] = useState(customerStore.profile.phone);
+  const [sessionToken, setSessionToken] = useState("");
+  const [collectMode, setCollectMode] = useState<GroupCollectMode>("host_collects");
+  const [hostQrUrl, setHostQrUrl] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+
+  async function createSession() {
+    if (!hostName.trim()) {
+      setError("Escribe tu nombre para crear la sala.");
+      return;
+    }
+    setLoading(true);
+    setError("");
+    try {
+      const result = await createMobileGroupOrderSession({
+        collectMode,
+        hostName: hostName.trim(),
+        hostPhone: hostPhone.trim() || undefined,
+        hostQrUrl: hostQrUrl.trim() || undefined,
+        restaurantSlug: restaurant.slug,
+      });
+      onOpenGroup({
+        hostAccessToken: result.hostAccessToken,
+        participantToken: result.participantToken,
+        sessionToken: result.sessionToken,
+      });
+    } catch (nextError) {
+      setError(groupOrderErrorMessage(nextError));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function joinSession() {
+    const cleanToken = sessionToken.trim();
+    if (!cleanToken || !displayName.trim()) {
+      setError("Agrega el codigo y tu nombre para unirte.");
+      return;
+    }
+    setLoading(true);
+    setError("");
+    try {
+      const result = await joinMobileGroupOrderSession(cleanToken, {
+        displayName: displayName.trim(),
+        phone: phone.trim() || undefined,
+      });
+      onOpenGroup({ participantToken: result.participantToken, sessionToken: cleanToken });
+    } catch (nextError) {
+      setError(groupOrderErrorMessage(nextError));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <Modal transparent animationType="slide" onRequestClose={onClose} visible>
+      <View style={styles.modalOverlay}>
+        <Pressable style={StyleSheet.absoluteFill} onPress={onClose} />
+        <SafeAreaView edges={["bottom"]} style={styles.groupStartSheet}>
+          <View style={styles.mapPickerHandle} />
+          <View style={styles.cartSheetHeader}>
+            <View>
+              <Text style={styles.cartSheetEyebrow}>Yopido Grupal</Text>
+              <Text style={styles.cartSheetTitle}>{mode === "create" ? "Crear sala" : "Unirme"}</Text>
+            </View>
+            <IconButton light onPress={onClose}><X color={colors.blue} size={22} strokeWidth={3} /></IconButton>
+          </View>
+
+          <View style={styles.segmentRow}>
+            <SegmentButton active={mode === "create"} icon={<UsersRound color={mode === "create" ? colors.blue : colors.muted} size={16} strokeWidth={3} />} onPress={() => setMode("create")} text="Crear" />
+            <SegmentButton active={mode === "join"} icon={<UsersRound color={mode === "join" ? colors.blue : colors.muted} size={16} strokeWidth={3} />} onPress={() => setMode("join")} text="Unirme" />
+          </View>
+
+          {mode === "create" ? (
+            <View style={styles.groupStartForm}>
+              <InputBox onChangeText={setHostName} placeholder="Tu nombre" value={hostName} />
+              <InputBox keyboardType="phone-pad" onChangeText={setHostPhone} placeholder="WhatsApp del host" value={hostPhone} />
+              <View style={styles.groupModeGrid}>
+                <ChoiceCard
+                  active={collectMode === "host_collects"}
+                  icon={<UsersRound color={collectMode === "host_collects" ? "#FFFFFF" : colors.blue} size={20} strokeWidth={3} />}
+                  label="Todos me pagan"
+                  onPress={() => setCollectMode("host_collects")}
+                  text="Subes tu QR o cobras por fuera y haces un solo pago."
+                />
+                <ChoiceCard
+                  active={collectMode === "restaurant_collects"}
+                  icon={<CreditCard color={collectMode === "restaurant_collects" ? "#FFFFFF" : colors.blue} size={20} strokeWidth={3} />}
+                  label="Cada uno paga"
+                  onPress={() => setCollectMode("restaurant_collects")}
+                  text="Cada participante confirma su pago al restaurante."
+                />
+              </View>
+              {collectMode === "host_collects" ? <InputBox onChangeText={setHostQrUrl} placeholder="Link de tu QR (opcional)" value={hostQrUrl} /> : null}
+              <PrimaryButton loading={loading} onPress={createSession} text={loading ? "Creando..." : "Crear sala grupal"} />
+            </View>
+          ) : (
+            <View style={styles.groupStartForm}>
+              <InputBox autoCapitalize="none" onChangeText={(value) => setSessionToken(value.trim())} placeholder="Codigo de sala" value={sessionToken} />
+              <InputBox onChangeText={setDisplayName} placeholder="Tu nombre" value={displayName} />
+              <InputBox keyboardType="phone-pad" onChangeText={setPhone} placeholder="WhatsApp (opcional)" value={phone} />
+              <PrimaryButton loading={loading} onPress={joinSession} text={loading ? "Uniendo..." : "Unirme a la sala"} />
+            </View>
+          )}
+          {error ? <Text style={styles.submitError}>{error}</Text> : null}
+        </SafeAreaView>
+      </View>
+    </Modal>
+  );
+}
+
+function GroupOrderScreen({
+  customerStore,
+  hostAccessToken,
+  participantToken,
+  restaurantSlug,
+  sessionToken,
+  onBack,
+  onRecentOrder,
+  onSavedAddress,
+  onTrack,
+}: {
+  customerStore: CustomerStore;
+  hostAccessToken?: string;
+  participantToken?: string;
+  restaurantSlug: string;
+  sessionToken?: string;
+  onBack: () => void;
+  onRecentOrder: (order: RecentOrder) => void;
+  onSavedAddress: (address: Omit<SavedAddress, "id" | "updatedAt">) => void;
+  onTrack: (order: { customerPhone?: string; orderId: string; orderNumber?: string; trackingToken: string }) => void;
+}) {
+  const [state, setState] = useState<MobileGroupOrderState | null>(null);
+  const [restaurant, setRestaurant] = useState<RestaurantSummary | null>(null);
+  const [categories, setCategories] = useState<CategorySummary[]>([]);
+  const [products, setProducts] = useState<ProductSummary[]>([]);
+  const [categoryId, setCategoryId] = useState("all");
+  const [query, setQuery] = useState("");
+  const [selectedProduct, setSelectedProduct] = useState<ProductSummary | null>(null);
+  const [checkoutOpen, setCheckoutOpen] = useState(false);
+  const [localParticipantToken, setLocalParticipantToken] = useState(participantToken);
+  const [localHostAccessToken] = useState(hostAccessToken);
+  const [loading, setLoading] = useState(Boolean(sessionToken));
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  const resolvedSessionToken = sessionToken || state?.session.publicToken || "";
+  const currentParticipant = state?.participants.find((participant) => participant.id === state.currentParticipantId);
+  const isHost = Boolean(state?.isHost && localHostAccessToken);
+  const visibleProducts = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    return products.filter((product) => {
+      const matchesCategory = categoryId === "all" || product.categoryId === categoryId;
+      const matchesQuery = !needle || `${product.name} ${product.description}`.toLowerCase().includes(needle);
+      return matchesCategory && matchesQuery;
+    });
+  }, [categoryId, products, query]);
+  const totalsByParticipant = useMemo(() => {
+    const totals = new Map<string, number>();
+    state?.items.forEach((item) => totals.set(item.participantId, (totals.get(item.participantId) ?? 0) + item.subtotal));
+    return totals;
+  }, [state?.items]);
+  const groupSubtotal = state?.items
+    .filter((item) => state.participants.find((participant) => participant.id === item.participantId)?.paymentStatus !== "excluded")
+    .reduce((sum, item) => sum + item.subtotal, 0) ?? 0;
+  const participantSubmitted = Boolean(!isHost && currentParticipant && currentParticipant.paymentStatus !== "pending");
+  const canModify = Boolean(state && state.session.status === "open" && (isHost || !participantSubmitted));
+
+  async function refresh(silent = false) {
+    if (!resolvedSessionToken) return;
+    if (!silent) setLoading(true);
+    try {
+      const nextState = await getMobileGroupOrderSession(resolvedSessionToken, {
+        hostAccessToken: localHostAccessToken,
+        participantToken: localParticipantToken,
+      });
+      setState(nextState);
+      const nextRestaurant = nextState.restaurant ?? (await getRestaurantBySlug(restaurantSlug));
+      if (nextRestaurant) {
+        setRestaurant(nextRestaurant);
+        const catalog = await listRestaurantCatalog(nextRestaurant.slug);
+        setCategories(catalog.categories);
+        setProducts(catalog.products);
+      }
+      setError("");
+    } catch (nextError) {
+      setError(groupOrderErrorMessage(nextError));
+    } finally {
+      if (!silent) setLoading(false);
+    }
+  }
+
+  async function handleAddLine(line: CartLine) {
+    if (!resolvedSessionToken || !localParticipantToken) {
+      setError("Unete a la sala antes de agregar productos.");
+      return;
+    }
+    setBusy(true);
+    try {
+      const nextState = await addMobileGroupOrderItem(resolvedSessionToken, {
+        optionIds: line.optionIds,
+        participantToken: localParticipantToken,
+        productId: line.productId,
+        variantId: line.variantId,
+        notes: line.notes,
+      });
+      setState(nextState);
+      setError("");
+    } catch (nextError) {
+      setError(groupOrderErrorMessage(nextError));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function quickAddProduct(product: ProductSummary) {
+    if (product.variants.length || product.optionGroups.length) {
+      setSelectedProduct(product);
+      return;
+    }
+    await handleAddLine({
+      cartId: product.id,
+      description: product.description,
+      imageUrl: product.imageUrl,
+      name: product.name,
+      optionIds: [],
+      price: product.price,
+      productId: product.id,
+      quantity: 0,
+    });
+  }
+
+  async function removeItem(item: MobileGroupItem) {
+    if (!resolvedSessionToken) return;
+    setBusy(true);
+    try {
+      const nextState = await removeMobileGroupOrderItem(resolvedSessionToken, {
+        hostAccessToken: localHostAccessToken,
+        itemId: item.id,
+        participantToken: localParticipantToken,
+      });
+      setState(nextState);
+    } catch (nextError) {
+      setError(groupOrderErrorMessage(nextError));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function markPayment(paymentStatus: GroupPaymentStatus, paymentReceiptUrl?: string) {
+    if (!resolvedSessionToken || !localParticipantToken) return;
+    setBusy(true);
+    try {
+      const nextState = await updateMobileGroupParticipantPayment(resolvedSessionToken, {
+        participantToken: localParticipantToken,
+        paymentReceiptUrl,
+        paymentStatus,
+      });
+      setState(nextState);
+      setError("");
+    } catch (nextError) {
+      setError(groupOrderErrorMessage(nextError));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function hostAction(action: "open" | "locked" | "cancelled") {
+    if (!resolvedSessionToken || !localHostAccessToken) return;
+    setBusy(true);
+    try {
+      setState(await updateMobileGroupHost(resolvedSessionToken, { action: "status", hostAccessToken: localHostAccessToken, status: action }));
+    } catch (nextError) {
+      setError(groupOrderErrorMessage(nextError));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function hostParticipant(participantId: string, paymentStatus: GroupPaymentStatus) {
+    if (!resolvedSessionToken || !localHostAccessToken) return;
+    setBusy(true);
+    try {
+      setState(await updateMobileGroupHost(resolvedSessionToken, { action: "participant", hostAccessToken: localHostAccessToken, participantId, paymentStatus }));
+    } catch (nextError) {
+      setError(groupOrderErrorMessage(nextError));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function shareGroup() {
+    if (!resolvedSessionToken) return;
+    const url = `${config.apiBaseUrl.replace(/\/$/, "")}/r/${restaurantSlug}/grupo/${resolvedSessionToken}`;
+    await Share.share({
+      message: `Unete a mi Yopido Grupal en ${restaurant?.name ?? "Yopido"}.\nCodigo: ${resolvedSessionToken}\n${url}`,
+    }).catch(() => undefined);
+  }
+
+  useEffect(() => {
+    void refresh();
+  }, [resolvedSessionToken]);
+
+  useEffect(() => {
+    if (!resolvedSessionToken || state?.session.status === "submitted" || state?.session.status === "cancelled") return;
+    const interval = setInterval(() => void refresh(true), state?.session.status === "open" ? 5000 : 10000);
+    return () => clearInterval(interval);
+  }, [resolvedSessionToken, state?.session.status, localParticipantToken, localHostAccessToken]);
+
+  if (loading && !state) return <YopidoLoader text="Cargando Yopido Grupal..." />;
+
+  if (!state || !restaurant) {
+    return (
+      <SafeAreaView style={styles.page}>
+        <View style={styles.centerContent}>
+          <EmptyMessage description={error || "Vuelve al restaurante e intenta nuevamente."} title="Sala no disponible" />
+          <PrimaryButton onPress={onBack} text="Volver" />
+        </View>
+      </SafeAreaView>
+    );
+  }
+
+  return (
+    <SafeAreaView edges={["top"]} style={styles.safeBlue}>
+      <FlatList
+        style={styles.restaurantList}
+        ListHeaderComponent={
+          <>
+            <View style={styles.groupHero}>
+              <View style={styles.bannerTopActions}>
+                <HeroActionButton accessibilityLabel="Volver" onPress={onBack}>
+                  <ChevronLeft color="#FFFFFF" size={22} strokeWidth={2.5} />
+                </HeroActionButton>
+                <HeroActionButton accessibilityLabel="Compartir" onPress={shareGroup}>
+                  <Share2 color="#FFFFFF" size={20} strokeWidth={2.5} />
+                </HeroActionButton>
+              </View>
+              <Text style={styles.tabEyebrow}>Yopido Grupal</Text>
+              <Text style={styles.tabTitle}>{restaurant.name}</Text>
+              <Text style={styles.tabCopy}>Codigo {state.session.publicToken} · {state.participants.length} participantes · {formatBs(groupSubtotal)}</Text>
+              <View style={styles.groupStatusRow}>
+                <View style={styles.groupStatusPill}><Text style={styles.groupStatusText}>{groupStatusLabel(state.session.status)}</Text></View>
+                {busy ? <ActivityIndicator color={colors.green} /> : null}
+              </View>
+            </View>
+
+            {participantSubmitted && !isHost ? (
+              <View style={styles.groupSubmittedCard}>
+                <CheckCircle2 color={colors.blue} size={34} strokeWidth={3} />
+                <Text style={styles.groupSubmittedTitle}>Tu parte fue enviada</Text>
+                <Text style={styles.groupSubmittedText}>El host ya puede verla. Si quieres agregar algo mas, se pedira confirmar de nuevo tu pago.</Text>
+                <PrimaryButton onPress={() => markPayment("pending")} text="Agregar algo mas" />
+              </View>
+            ) : null}
+
+            <View style={styles.groupPanel}>
+              <View style={styles.restaurantSectionHeader}>
+                <SectionTitle eyebrow="Participantes" title="Resumen del grupo" />
+                <Text style={styles.groupTotal}>{formatBs(groupSubtotal)}</Text>
+              </View>
+              <View style={styles.groupParticipantsList}>
+                {state.participants.map((participant) => (
+                  <GroupParticipantCard
+                    isHost={isHost}
+                    key={participant.id}
+                    onChangeStatus={(paymentStatus) => hostParticipant(participant.id, paymentStatus)}
+                    participant={participant}
+                    total={totalsByParticipant.get(participant.id) ?? 0}
+                  />
+                ))}
+              </View>
+              {isHost ? (
+                <View style={styles.groupHostActions}>
+                  <PrimaryButton onPress={() => hostAction(state.session.status === "locked" ? "open" : "locked")} text={state.session.status === "locked" ? "Reabrir sala" : "Cerrar ingreso"} />
+                  <PrimaryButton disabled={!state.items.length} onPress={() => setCheckoutOpen(true)} text="Finalizar pedido grupal" />
+                  <Pressable onPress={() => hostAction("cancelled")} style={styles.groupDangerButton}>
+                    <Text style={styles.groupDangerText}>Cancelar sala</Text>
+                  </Pressable>
+                </View>
+              ) : null}
+            </View>
+
+            {currentParticipant && !participantSubmitted ? (
+              <ParticipantPaymentBox
+                collectMode={state.session.collectMode}
+                hostQrUrl={state.session.hostQrUrl}
+                onMarkPayment={markPayment}
+                participant={currentParticipant}
+                total={totalsByParticipant.get(currentParticipant.id) ?? 0}
+              />
+            ) : null}
+
+            {canModify ? (
+              <>
+                <View style={styles.restaurantSearchShell}>
+                  <Search color={colors.muted} size={19} strokeWidth={3} />
+                  <TextInput onChangeText={setQuery} placeholder="Busca productos para tu parte" placeholderTextColor="#8A98AB" style={styles.restaurantSearchInput} value={query} />
+                </View>
+                <View style={styles.categorySection}>
+                  <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.categoryRail}>
+                    <CategoryChip active={categoryId === "all"} label="Todo" onPress={() => setCategoryId("all")} />
+                    {categories.map((category) => <CategoryChip active={categoryId === category.id} key={category.id} label={category.name} onPress={() => setCategoryId(category.id)} />)}
+                  </ScrollView>
+                </View>
+              </>
+            ) : null}
+            {error ? <Text style={styles.error}>{error}</Text> : null}
+          </>
+        }
+        contentContainerStyle={styles.contentWithCart}
+        data={canModify ? visibleProducts : []}
+        keyExtractor={(item) => item.id}
+        renderItem={({ item }) => (
+          <ProductCard
+            favorite={false}
+            onAdd={() => void quickAddProduct(item)}
+            onMinus={() => undefined}
+            onPress={() => setSelectedProduct(item)}
+            onToggleFavorite={() => undefined}
+            orderingDisabled={busy}
+            product={item}
+            quantity={state.items.filter((groupItem) => groupItem.productId === item.id && groupItem.participantId === state.currentParticipantId).length}
+          />
+        )}
+        ListFooterComponent={
+          <View style={styles.groupItemsFooter}>
+            <Text style={styles.restaurantSectionTitle}>Productos agregados</Text>
+            {state.items.length ? state.items.map((item) => {
+              const owner = state.participants.find((participant) => participant.id === item.participantId);
+              const canRemoveItem = isHost || item.participantId === state.currentParticipantId;
+              return (
+                <View key={item.id} style={styles.groupItemRow}>
+                  <View style={styles.groupItemBody}>
+                    <Text numberOfLines={1} style={styles.cartLineName}>{item.quantity}x {item.productName}</Text>
+                    <Text style={styles.cartLineNotes}>{owner?.displayName ?? "Participante"} · {formatBs(item.subtotal)}</Text>
+                  </View>
+                  {canRemoveItem && state.session.status !== "submitted" ? (
+                    <Pressable disabled={busy} onPress={() => void removeItem(item)} style={styles.qtyButtonSmall}>
+                      <X color={colors.blue} size={14} strokeWidth={4} />
+                    </Pressable>
+                  ) : null}
+                </View>
+              );
+            }) : <EmptyMessage description="Cuando agreguen productos apareceran aqui." title="Sin productos" />}
+          </View>
+        }
+      />
+      {selectedProduct ? (
+        <ProductModal
+          onAdd={handleAddLine}
+          onClose={() => setSelectedProduct(null)}
+          orderingDisabled={busy || !canModify}
+          product={selectedProduct}
+          quantity={0}
+        />
+      ) : null}
+      {checkoutOpen && localHostAccessToken ? (
+        <GroupCheckoutSheet
+          customerStore={customerStore}
+          hostAccessToken={localHostAccessToken}
+          onClose={() => setCheckoutOpen(false)}
+          onRecentOrder={onRecentOrder}
+          onSavedAddress={onSavedAddress}
+          onTrack={onTrack}
+          restaurant={restaurant}
+          session={state}
+          sessionToken={state.session.publicToken}
+          subtotal={groupSubtotal}
+        />
+      ) : null}
+    </SafeAreaView>
+  );
+}
+
+function GroupParticipantCard({
+  isHost,
+  participant,
+  total,
+  onChangeStatus,
+}: {
+  isHost: boolean;
+  participant: MobileGroupParticipant;
+  total: number;
+  onChangeStatus: (paymentStatus: GroupPaymentStatus) => void;
+}) {
+  return (
+    <View style={styles.groupParticipantCard}>
+      <View style={styles.groupParticipantTop}>
+        <View>
+          <Text style={styles.cartLineName}>{participant.displayName}{participant.role === "host" ? " · host" : ""}</Text>
+          <Text style={styles.cartLineNotes}>{paymentStatusLabel(participant.paymentStatus)}</Text>
+        </View>
+        <Text style={styles.groupTotal}>{formatBs(total)}</Text>
+      </View>
+      {participant.paymentReceiptUrl ? (
+        <Pressable onPress={() => Linking.openURL(participant.paymentReceiptUrl).catch(() => undefined)} style={styles.groupReceiptButton}>
+          <ReceiptText color={colors.blue} size={15} strokeWidth={3} />
+          <Text style={styles.groupReceiptText}>Ver comprobante</Text>
+        </Pressable>
+      ) : null}
+      {isHost && participant.role !== "host" ? (
+        <View style={styles.groupMiniActions}>
+          <Pressable onPress={() => onChangeStatus("covered_by_host")} style={styles.groupMiniButton}><Text style={styles.groupMiniText}>Cubrir</Text></Pressable>
+          <Pressable onPress={() => onChangeStatus("cash_pending")} style={styles.groupMiniButton}><Text style={styles.groupMiniText}>Efectivo</Text></Pressable>
+          <Pressable onPress={() => onChangeStatus("excluded")} style={[styles.groupMiniButton, styles.groupMiniDanger]}><Text style={[styles.groupMiniText, styles.groupMiniDangerText]}>Excluir</Text></Pressable>
+        </View>
+      ) : null}
+    </View>
+  );
+}
+
+function ParticipantPaymentBox({
+  collectMode,
+  hostQrUrl,
+  participant,
+  total,
+  onMarkPayment,
+}: {
+  collectMode: GroupCollectMode;
+  hostQrUrl: string;
+  participant: MobileGroupParticipant;
+  total: number;
+  onMarkPayment: (paymentStatus: GroupPaymentStatus, paymentReceiptUrl?: string) => void;
+}) {
+  const [receiptUrl, setReceiptUrl] = useState(participant.paymentReceiptUrl);
+  if (total <= 0) return null;
+  return (
+    <View style={styles.groupPanel}>
+      <SectionTitle eyebrow="Tu pago" title={`Tu parte ${formatBs(total)}`} />
+      <Text style={styles.paymentHint}>{collectMode === "host_collects" ? "Paga al host o marca efectivo si lo arreglaran al entregar." : "Confirma tu pago para que el host pueda finalizar."}</Text>
+      {hostQrUrl ? (
+        <Pressable onPress={() => Linking.openURL(hostQrUrl).catch(() => undefined)} style={styles.groupReceiptButton}>
+          <CreditCard color={colors.blue} size={16} strokeWidth={3} />
+          <Text style={styles.groupReceiptText}>Abrir QR del host</Text>
+        </Pressable>
+      ) : null}
+      <InputBox onChangeText={setReceiptUrl} placeholder="Link del comprobante QR" value={receiptUrl} />
+      <View style={styles.groupHostActions}>
+        <PrimaryButton onPress={() => onMarkPayment("paid_qr", receiptUrl.trim())} text="Enviar comprobante" />
+        <PrimaryButton onPress={() => onMarkPayment("cash_pending")} text="Pagare en efectivo" />
+      </View>
+    </View>
+  );
+}
+
+function GroupCheckoutSheet({
+  customerStore,
+  hostAccessToken,
+  restaurant,
+  session,
+  sessionToken,
+  subtotal,
+  onClose,
+  onRecentOrder,
+  onSavedAddress,
+  onTrack,
+}: {
+  customerStore: CustomerStore;
+  hostAccessToken: string;
+  restaurant: RestaurantSummary;
+  session: MobileGroupOrderState;
+  sessionToken: string;
+  subtotal: number;
+  onClose: () => void;
+  onRecentOrder: (order: RecentOrder) => void;
+  onSavedAddress: (address: Omit<SavedAddress, "id" | "updatedAt">) => void;
+  onTrack: (order: { customerPhone?: string; orderId: string; orderNumber?: string; trackingToken: string }) => void;
+}) {
+  const firstAddress = customerStore.addresses[0];
+  const [customerName, setCustomerName] = useState(customerStore.profile.name || session.session.hostName);
+  const [phone, setPhone] = useState(customerStore.profile.phone || session.session.hostPhone);
+  const [orderType, setOrderType] = useState<"delivery" | "pickup">("pickup");
+  const [paymentMethod, setPaymentMethod] = useState<"cash" | "qr">("cash");
+  const [address, setAddress] = useState(firstAddress?.address ?? "");
+  const [deliveryLocation, setDeliveryLocation] = useState<DeliveryLocation | null>(
+    firstAddress?.latitude != null && firstAddress.longitude != null
+      ? { latitude: firstAddress.latitude, longitude: firstAddress.longitude, mapsUrl: firstAddress.mapsUrl ?? googleMapsUrl(firstAddress.latitude, firstAddress.longitude), label: firstAddress.label }
+      : null,
+  );
+  const [receiptUrl, setReceiptUrl] = useState("");
+  const [mapPickerOpen, setMapPickerOpen] = useState(false);
+  const [sending, setSending] = useState(false);
+  const [error, setError] = useState("");
+  const deliveryFee = orderType === "delivery" ? 8 : 0;
+  const total = subtotal + deliveryFee;
+
+  async function send() {
+    if (!customerName.trim()) {
+      setError("Agrega el nombre del host.");
+      return;
+    }
+    if (orderType === "delivery" && (!address.trim() || !deliveryLocation)) {
+      setError("Marca la direccion y el punto de entrega.");
+      return;
+    }
+    setSending(true);
+    setError("");
+    try {
+      const order = await submitMobileGroupOrder(sessionToken, {
+        customerAddress: orderType === "delivery" ? address.trim() : undefined,
+        customerName: customerName.trim(),
+        customerPhone: phone.trim() || undefined,
+        deliveryLatitude: orderType === "delivery" ? deliveryLocation?.latitude : undefined,
+        deliveryLongitude: orderType === "delivery" ? deliveryLocation?.longitude : undefined,
+        deliveryMapsUrl: orderType === "delivery" ? deliveryLocation?.mapsUrl : undefined,
+        hostAccessToken,
+        orderType,
+        paymentMethod,
+        paymentReceiptUrl: paymentMethod === "qr" ? receiptUrl.trim() : undefined,
+        restaurantSlug: restaurant.slug,
+      });
+      onRecentOrder({
+        createdAt: new Date().toISOString(),
+        customerPhone: phone.trim(),
+        id: order.orderId,
+        orderNumber: order.orderNumber,
+        orderType,
+        restaurantName: restaurant.name,
+        restaurantSlug: restaurant.slug,
+        status: "pending",
+        total,
+        trackingToken: order.trackingToken,
+      });
+      if (orderType === "delivery" && address.trim()) {
+        onSavedAddress({
+          address: address.trim(),
+          city: restaurant.city,
+          label: deliveryLocation?.label ?? "Direccion grupal",
+          latitude: deliveryLocation?.latitude,
+          longitude: deliveryLocation?.longitude,
+          mapsUrl: deliveryLocation?.mapsUrl,
+        });
+      }
+      onClose();
+      onTrack({ customerPhone: phone.trim(), orderId: order.orderId, orderNumber: order.orderNumber, trackingToken: order.trackingToken });
+    } catch (nextError) {
+      setError(groupOrderErrorMessage(nextError));
+    } finally {
+      setSending(false);
+    }
+  }
+
+  return (
+    <Modal transparent animationType="slide" onRequestClose={onClose} visible>
+      <View style={styles.modalOverlay}>
+        <Pressable style={StyleSheet.absoluteFill} onPress={onClose} />
+        <View style={styles.cartSheet}>
+          <View style={styles.cartSheetHeader}>
+            <View>
+              <Text style={styles.cartSheetEyebrow}>Finalizar grupo</Text>
+              <Text style={styles.cartSheetTitle}>Enviar pedido</Text>
+            </View>
+            <IconButton light onPress={onClose}><X color={colors.blue} size={22} strokeWidth={3} /></IconButton>
+          </View>
+          <ScrollView showsVerticalScrollIndicator={false} style={styles.cartScroll}>
+            <View style={styles.choiceGrid}>
+              <ChoiceCard active={orderType === "pickup"} icon={<Store color={orderType === "pickup" ? "#FFFFFF" : colors.blue} size={20} strokeWidth={3} />} label="Recojo" onPress={() => setOrderType("pickup")} text={restaurant.address || "El local confirma la direccion."} />
+              <ChoiceCard active={orderType === "delivery"} icon={<Bike color={orderType === "delivery" ? "#FFFFFF" : colors.blue} size={20} strokeWidth={3} />} label="Delivery" onPress={() => setOrderType("delivery")} text={`${formatBs(deliveryFee)} estimado`} />
+            </View>
+            <InputBox onChangeText={setCustomerName} placeholder="Nombre del host" value={customerName} />
+            <InputBox keyboardType="phone-pad" onChangeText={setPhone} placeholder="WhatsApp" value={phone} />
+            {orderType === "delivery" ? (
+              <>
+                <InputBox multiline onChangeText={setAddress} placeholder="Direccion de entrega" value={address} />
+                <DeliveryMapPreview location={deliveryLocation} locating={false} onOpenMap={() => setMapPickerOpen(true)} onUseCurrent={() => setMapPickerOpen(true)} />
+              </>
+            ) : null}
+            <View style={styles.segmentRow}>
+              <SegmentButton active={paymentMethod === "cash"} icon={<Banknote color={paymentMethod === "cash" ? colors.blue : colors.muted} size={16} strokeWidth={3} />} onPress={() => setPaymentMethod("cash")} text="Efectivo" />
+              <SegmentButton active={paymentMethod === "qr"} icon={<CreditCard color={paymentMethod === "qr" ? colors.blue : colors.muted} size={16} strokeWidth={3} />} onPress={() => setPaymentMethod("qr")} text="QR" />
+            </View>
+            {paymentMethod === "qr" ? <InputBox onChangeText={setReceiptUrl} placeholder="Link del comprobante final" value={receiptUrl} /> : null}
+            <View style={styles.totalBox}>
+              <TotalLine label="Subtotal grupal" value={formatBs(subtotal)} />
+              <TotalLine label="Envio" value={formatBs(deliveryFee)} />
+              <TotalLine strong label="Total" value={formatBs(total)} />
+            </View>
+            {error ? <Text style={styles.submitError}>{error}</Text> : null}
+            <PrimaryButton loading={sending} onPress={send} text={sending ? "Enviando..." : "Enviar a caja"} />
+          </ScrollView>
+          {mapPickerOpen ? (
+            <MapPickerModal
+              initialLocation={deliveryLocation}
+              onClose={() => setMapPickerOpen(false)}
+              onConfirm={(location) => {
+                setDeliveryLocation(location);
+                if (!address.trim()) setAddress(`${location.label}\n${location.mapsUrl}`);
+                setMapPickerOpen(false);
+              }}
+              restaurant={restaurant}
+            />
+          ) : null}
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
+function paymentStatusLabel(status: GroupPaymentStatus) {
+  if (status === "paid_qr") return "Pago QR enviado";
+  if (status === "cash_pending") return "Pagara en efectivo";
+  if (status === "covered_by_host") return "Cubierto por host";
+  if (status === "excluded") return "Excluido";
+  return "Pendiente";
+}
+
+function groupStatusLabel(status: string) {
+  if (status === "locked") return "Cerrada para nuevos cambios";
+  if (status === "submitted") return "Pedido enviado";
+  if (status === "cancelled") return "Cancelada";
+  if (status === "expired") return "Expirada";
+  return "Abierta";
 }
 
 function HomeSkeleton() {
@@ -2140,6 +2923,7 @@ function AccountScreen({
   const [phone, setPhone] = useState(customerStore.profile.phone);
   const [documentNumber, setDocumentNumber] = useState(customerStore.profile.documentNumber);
   const [loading, setLoading] = useState(false);
+  const [googleLoading, setGoogleLoading] = useState(false);
   const [profileSaving, setProfileSaving] = useState(false);
   const [addressSaving, setAddressSaving] = useState(false);
   const [profileEditorOpen, setProfileEditorOpen] = useState(false);
@@ -2224,7 +3008,6 @@ function AccountScreen({
     }
 
     try {
-      const credentials = { email: cleanEmail, password };
       if (mode === "register") {
         await registerCustomerAccount({
           documentNumber: cleanDocumentNumber,
@@ -2235,11 +3018,12 @@ function AccountScreen({
         });
       }
 
-      const { error } = await supabase.auth.signInWithPassword(credentials);
-      if (error) {
-        setErrorMessage(error.message);
-        return;
-      }
+      const authSession = await signInCustomerAccount(cleanEmail, password);
+      const { error } = await supabase.auth.setSession({
+        access_token: authSession.accessToken,
+        refresh_token: authSession.refreshToken,
+      });
+      if (error) throw error;
 
       setPassword("");
       if (mode === "register") {
@@ -2250,6 +3034,22 @@ function AccountScreen({
       setErrorMessage(customerErrorMessage(error));
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function submitGoogleAuth() {
+    setGoogleLoading(true);
+    setErrorMessage("");
+    setSuccessMessage("");
+    try {
+      const session = await signInCustomerWithGoogle();
+      if (session) {
+        setSuccessMessage("Sesion iniciada con Google.");
+      }
+    } catch (error) {
+      setErrorMessage(customerErrorMessage(error));
+    } finally {
+      setGoogleLoading(false);
     }
   }
 
@@ -2418,6 +3218,19 @@ function AccountScreen({
         {!sessionUser ? (
           <View style={styles.accountCard}>
             <SectionTitle eyebrow="Acceso" title={mode === "login" ? "Ingresa a tu cuenta" : "Crea tu cuenta"} />
+            <Pressable
+              disabled={loading || googleLoading}
+              onPress={submitGoogleAuth}
+              style={({ pressed }) => [styles.googleAuthButton, (loading || googleLoading) && styles.primaryButtonDisabled, pressed && styles.pressedCard]}
+            >
+              <View style={styles.googleAuthBadge}><Text style={styles.googleAuthBadgeText}>G</Text></View>
+              {googleLoading ? <ActivityIndicator color={colors.blue} size="small" /> : <Text style={styles.googleAuthText}>Continuar con Google</Text>}
+            </Pressable>
+            <View style={styles.authDivider}>
+              <View style={styles.authDividerLine} />
+              <Text style={styles.authDividerText}>O usa correo</Text>
+              <View style={styles.authDividerLine} />
+            </View>
             <View style={styles.segmentRow}>
               <SegmentButton active={mode === "login"} icon={<Mail color={mode === "login" ? colors.blue : colors.muted} size={16} strokeWidth={3} />} onPress={() => setMode("login")} text="Ingresar" />
               <SegmentButton active={mode === "register"} icon={<Plus color={mode === "register" ? colors.blue : colors.muted} size={16} strokeWidth={3} />} onPress={() => setMode("register")} text="Registro" />
@@ -2433,7 +3246,7 @@ function AccountScreen({
             <InputBox onChangeText={setPassword} placeholder="Contrasena" secureTextEntry value={password} />
             {errorMessage ? <Text style={styles.submitError}>{errorMessage}</Text> : null}
             {successMessage ? <Text style={styles.successInline}>{successMessage}</Text> : null}
-            <PrimaryButton disabled={loading || !email.trim() || password.length < 6 || (mode === "register" && (!name.trim() || !phone.trim() || !documentNumber.trim()))} loading={loading} onPress={submitAuth} text={mode === "login" ? "Iniciar sesion" : "Crear cuenta"} />
+            <PrimaryButton disabled={loading || googleLoading || !email.trim() || password.length < 6 || (mode === "register" && (!name.trim() || !phone.trim() || !documentNumber.trim()))} loading={loading} onPress={submitAuth} text={mode === "login" ? "Iniciar sesion" : "Crear cuenta"} />
             {loading ? <AuthLoadingOverlay text={mode === "login" ? "Ingresando a tu cuenta..." : "Creando tu cuenta..."} /> : null}
           </View>
         ) : panelView === "addresses" ? (
@@ -4711,6 +5524,9 @@ const styles = StyleSheet.create({
   authLoadingOverlay: { alignItems: "center", backgroundColor: "rgba(8,36,65,0.62)", flex: 1, justifyContent: "center" },
   authLoadingText: { color: "#FFFFFFC7", fontSize: 13, fontWeight: "800" },
   authLoadingTitle: { color: "#FFFFFF", fontSize: 15, fontWeight: "900", textAlign: "center" },
+  authDivider: { alignItems: "center", flexDirection: "row", gap: 10, paddingVertical: 2 },
+  authDividerLine: { backgroundColor: colors.border, flex: 1, height: 1 },
+  authDividerText: { color: colors.muted, fontSize: 10, fontWeight: "900", textTransform: "uppercase" },
   backStepButton: { alignItems: "center", alignSelf: "flex-start", flexDirection: "row", gap: 5, paddingHorizontal: 4, paddingVertical: 8 },
   backStepText: { color: colors.blue, fontSize: 13, fontWeight: "900" },
   banner: { backgroundColor: colors.blue, borderRadius: 25, height: 258, marginHorizontal: 14, marginTop: 14, overflow: "hidden", shadowColor: colors.blue, shadowOpacity: 0.16, shadowRadius: 14 },
@@ -4826,6 +5642,43 @@ const styles = StyleSheet.create({
   fulfillmentSwitchButtonActive: { backgroundColor: colors.blue },
   fulfillmentSwitchText: { color: colors.muted, fontSize: 13, fontWeight: "900" },
   fulfillmentSwitchTextActive: { color: "#FFFFFF" },
+  groupDangerButton: { alignItems: "center", alignSelf: "center", backgroundColor: "#FFF1F3", borderColor: "#FECDD3", borderRadius: 999, borderWidth: 1, minHeight: 44, paddingHorizontal: 16, justifyContent: "center" },
+  groupDangerText: { color: colors.danger, fontSize: 13, fontWeight: "900" },
+  groupEntryBody: { flex: 1, minWidth: 0 },
+  groupEntryCard: { alignItems: "center", backgroundColor: "#FFFFFF", borderColor: colors.border, borderRadius: 22, borderWidth: 1, elevation: 2, flexDirection: "row", gap: 12, marginHorizontal: 14, marginTop: 14, padding: 13, shadowColor: colors.blue, shadowOpacity: 0.08, shadowRadius: 12 },
+  groupEntryIcon: { alignItems: "center", backgroundColor: colors.green, borderRadius: 18, height: 48, justifyContent: "center", width: 48 },
+  groupEntryText: { color: colors.muted, fontSize: 12, fontWeight: "800", lineHeight: 17, marginTop: 2 },
+  groupEntryTitle: { color: colors.ink, fontSize: 17, fontWeight: "900" },
+  groupHero: { backgroundColor: colors.blue, borderBottomLeftRadius: 28, borderBottomRightRadius: 28, gap: 8, padding: 16, paddingBottom: 22 },
+  groupHostActions: { gap: 9, marginTop: 12 },
+  groupItemBody: { flex: 1, minWidth: 0 },
+  groupItemRow: { alignItems: "center", backgroundColor: "#FFFFFF", borderColor: colors.border, borderRadius: 18, borderWidth: 1, flexDirection: "row", gap: 10, marginTop: 8, padding: 11 },
+  groupItemsFooter: { gap: 8, paddingHorizontal: 14, paddingTop: 4 },
+  groupMiniActions: { flexDirection: "row", flexWrap: "wrap", gap: 7, marginTop: 10 },
+  groupMiniButton: { backgroundColor: colors.softBlue, borderColor: colors.border, borderRadius: 999, borderWidth: 1, minHeight: 34, paddingHorizontal: 10, justifyContent: "center" },
+  groupMiniDanger: { backgroundColor: "#FFF1F3", borderColor: "#FECDD3" },
+  groupMiniDangerText: { color: colors.danger },
+  groupMiniText: { color: colors.blue, fontSize: 11, fontWeight: "900" },
+  groupModeGrid: { gap: 10 },
+  groupPanel: { backgroundColor: "#FFFFFF", borderColor: colors.border, borderRadius: 22, borderWidth: 1, gap: 10, marginHorizontal: 14, marginTop: 14, padding: 14, shadowColor: colors.blue, shadowOpacity: 0.07, shadowRadius: 12 },
+  groupParticipantCard: { backgroundColor: colors.background, borderColor: colors.border, borderRadius: 18, borderWidth: 1, padding: 11 },
+  groupParticipantTop: { alignItems: "flex-start", flexDirection: "row", gap: 10, justifyContent: "space-between" },
+  groupParticipantsList: { gap: 9 },
+  groupReceiptButton: { alignItems: "center", alignSelf: "flex-start", backgroundColor: colors.green, borderRadius: 999, flexDirection: "row", gap: 6, marginTop: 9, minHeight: 36, paddingHorizontal: 11 },
+  groupReceiptText: { color: colors.blue, fontSize: 12, fontWeight: "900" },
+  groupStartForm: { gap: 12, marginTop: 14 },
+  groupStartSheet: { backgroundColor: colors.surface, borderTopLeftRadius: 28, borderTopRightRadius: 28, bottom: 0, gap: 8, left: 0, padding: 18, position: "absolute", right: 0 },
+  groupStatusPill: { alignSelf: "flex-start", backgroundColor: "#FFFFFF", borderRadius: 999, paddingHorizontal: 11, paddingVertical: 6 },
+  groupStatusRow: { alignItems: "center", flexDirection: "row", gap: 10, marginTop: 4 },
+  groupStatusText: { color: colors.blue, fontSize: 12, fontWeight: "900" },
+  groupSubmittedCard: { alignItems: "center", backgroundColor: "#F3FFE0", borderColor: colors.green, borderRadius: 22, borderWidth: 1, gap: 8, marginHorizontal: 14, marginTop: 14, padding: 16 },
+  groupSubmittedText: { color: colors.blue, fontSize: 13, fontWeight: "800", lineHeight: 19, textAlign: "center" },
+  groupSubmittedTitle: { color: colors.ink, fontSize: 19, fontWeight: "900" },
+  groupTotal: { color: colors.blue, fontSize: 16, fontWeight: "900" },
+  googleAuthBadge: { alignItems: "center", backgroundColor: "#FFFFFF", borderColor: colors.border, borderRadius: 999, borderWidth: 1, height: 30, justifyContent: "center", width: 30 },
+  googleAuthBadgeText: { color: "#4285F4", fontSize: 16, fontWeight: "900" },
+  googleAuthButton: { alignItems: "center", backgroundColor: "#FFFFFF", borderColor: colors.border, borderRadius: 16, borderWidth: 1, flexDirection: "row", gap: 10, justifyContent: "center", minHeight: 50, paddingHorizontal: 14 },
+  googleAuthText: { color: colors.ink, fontSize: 14, fontWeight: "900" },
   headerSpacer: { flex: 1 },
   heroActionButton: { alignItems: "center", backgroundColor: "rgba(8,36,65,0.58)", borderColor: "rgba(255,255,255,0.22)", borderRadius: 999, borderWidth: 1, height: 44, justifyContent: "center", width: 44 },
   heroActionButtonPressed: { opacity: 0.78, transform: [{ scale: 0.98 }] },
