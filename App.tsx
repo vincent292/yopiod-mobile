@@ -1,4 +1,5 @@
 import * as Location from "expo-location";
+import * as ImagePicker from "expo-image-picker";
 import { LinearGradient } from "expo-linear-gradient";
 import { StatusBar as ExpoStatusBar } from "expo-status-bar";
 import {
@@ -103,7 +104,7 @@ import {
   updateMobileGroupHost,
   updateMobileGroupParticipantPayment,
 } from "./src/lib/group-orders";
-import type { GroupCollectMode, GroupPaymentStatus, MobileGroupItem, MobileGroupOrderState, MobileGroupParticipant } from "./src/lib/group-orders";
+import type { GroupCollectMode, GroupPaymentStatus, MobileGroupItem, MobileGroupOrderState, MobileGroupParticipant, MobileUploadFile } from "./src/lib/group-orders";
 import { listenForOrderNotificationOpen, requestOrderNotificationRegistration, scheduleOrderNotificationTest } from "./src/lib/push";
 import type { LocalNotificationResult, PushRegistration, PushRegistrationResult } from "./src/lib/push";
 import { supabase } from "./src/lib/supabase";
@@ -238,6 +239,40 @@ function restaurantMapsUrl(restaurant: Pick<RestaurantSummary, "address" | "city
 const savedAddressSnapRadiusKm = 0.3;
 const cachedHomeLocationMaxAgeMs = 12 * 60 * 60 * 1000;
 const lastKnownLocationMaxAgeMs = 5 * 60 * 1000;
+const groupUploadMaxBytes = 5 * 1024 * 1024;
+
+function uploadNameFromAsset(asset: ImagePicker.ImagePickerAsset, fallback: string) {
+  if (asset.fileName) return asset.fileName;
+  const extension = asset.mimeType?.split("/").pop() || asset.uri.split(".").pop()?.split("?")[0] || "jpg";
+  return `${fallback}.${extension}`;
+}
+
+async function pickGroupImageUpload(fallbackName: string): Promise<MobileUploadFile | null> {
+  const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
+  if (!permission.granted) {
+    Alert.alert("Permiso requerido", "Permite acceso a tus fotos para subir el QR o comprobante.");
+    return null;
+  }
+
+  const result = await ImagePicker.launchImageLibraryAsync({
+    allowsEditing: false,
+    mediaTypes: ["images"],
+    quality: 0.82,
+  });
+  if (result.canceled || !result.assets[0]) return null;
+
+  const asset = result.assets[0];
+  if (asset.fileSize && asset.fileSize > groupUploadMaxBytes) {
+    Alert.alert("Archivo muy pesado", "El archivo debe pesar menos de 5 MB.");
+    return null;
+  }
+
+  return {
+    name: uploadNameFromAsset(asset, fallbackName),
+    type: asset.mimeType || "image/jpeg",
+    uri: asset.uri,
+  };
+}
 
 function savedAddressToLocation(address: SavedAddress): UserLocation | null {
   if (!Number.isFinite(address.latitude) || !Number.isFinite(address.longitude)) return null;
@@ -1786,7 +1821,7 @@ function GroupOrderStartSheet({
   const [phone, setPhone] = useState(customerStore.profile.phone);
   const [sessionToken, setSessionToken] = useState("");
   const [collectMode, setCollectMode] = useState<GroupCollectMode>("host_collects");
-  const [hostQrUrl, setHostQrUrl] = useState("");
+  const [hostQrFile, setHostQrFile] = useState<MobileUploadFile | null>(null);
   const [scannerOpen, setScannerOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -1803,7 +1838,7 @@ function GroupOrderStartSheet({
         collectMode,
         hostName: hostName.trim(),
         hostPhone: hostPhone.trim() || undefined,
-        hostQrUrl: hostQrUrl.trim() || undefined,
+        hostQrFile: collectMode === "host_collects" ? hostQrFile : null,
         restaurantSlug: restaurant.slug,
       });
       onOpenGroup({
@@ -1888,7 +1923,18 @@ function GroupOrderStartSheet({
                   text="Cada participante confirma su pago al restaurante."
                 />
               </View>
-              {collectMode === "host_collects" ? <InputBox onChangeText={setHostQrUrl} placeholder="Link de tu QR (opcional)" value={hostQrUrl} /> : null}
+              {collectMode === "host_collects" ? (
+                <UploadPicker
+                  description="Se guarda temporalmente para esta sala."
+                  file={hostQrFile}
+                  label="QR para que te paguen"
+                  onClear={() => setHostQrFile(null)}
+                  onPick={async () => {
+                    const file = await pickGroupImageUpload("qr-host");
+                    if (file) setHostQrFile(file);
+                  }}
+                />
+              ) : null}
               <PrimaryButton loading={loading} onPress={createSession} text={loading ? "Creando..." : "Crear sala grupal"} />
             </View>
           ) : (
@@ -2055,12 +2101,13 @@ function GroupOrderScreen({
     }
   }
 
-  async function markPayment(paymentStatus: GroupPaymentStatus, paymentReceiptUrl?: string) {
+  async function markPayment(paymentStatus: GroupPaymentStatus, paymentReceiptFile?: MobileUploadFile | null, paymentReceiptUrl?: string) {
     if (!resolvedSessionToken || !localParticipantToken) return;
     setBusy(true);
     try {
       const nextState = await updateMobileGroupParticipantPayment(resolvedSessionToken, {
         participantToken: localParticipantToken,
+        paymentReceiptFile,
         paymentReceiptUrl,
         paymentStatus,
       });
@@ -2385,9 +2432,9 @@ function ParticipantPaymentBox({
   hostQrUrl: string;
   participant: MobileGroupParticipant;
   total: number;
-  onMarkPayment: (paymentStatus: GroupPaymentStatus, paymentReceiptUrl?: string) => void;
+  onMarkPayment: (paymentStatus: GroupPaymentStatus, paymentReceiptFile?: MobileUploadFile | null, paymentReceiptUrl?: string) => void;
 }) {
-  const [receiptUrl, setReceiptUrl] = useState(participant.paymentReceiptUrl);
+  const [receiptFile, setReceiptFile] = useState<MobileUploadFile | null>(null);
   if (total <= 0) return null;
   return (
     <View style={styles.groupPanel}>
@@ -2399,9 +2446,18 @@ function ParticipantPaymentBox({
           <Text style={styles.groupReceiptText}>Abrir QR del host</Text>
         </Pressable>
       ) : null}
-      <InputBox onChangeText={setReceiptUrl} placeholder="Link del comprobante QR" value={receiptUrl} />
+      <UploadPicker
+        description={participant.paymentReceiptUrl ? "Ya tienes un comprobante enviado. Puedes subir otro para reemplazarlo." : "Captura del pago QR desde tu galeria."}
+        file={receiptFile}
+        label="Comprobante de pago"
+        onClear={() => setReceiptFile(null)}
+        onPick={async () => {
+          const file = await pickGroupImageUpload("comprobante-grupal");
+          if (file) setReceiptFile(file);
+        }}
+      />
       <View style={styles.groupHostActions}>
-        <PrimaryButton onPress={() => onMarkPayment("paid_qr", receiptUrl.trim())} text="Enviar comprobante" />
+        <PrimaryButton disabled={!receiptFile && !participant.paymentReceiptUrl} onPress={() => onMarkPayment("paid_qr", receiptFile, participant.paymentReceiptUrl)} text="Enviar comprobante" />
         <PrimaryButton onPress={() => onMarkPayment("cash_pending")} text="Pagare en efectivo" />
       </View>
     </View>
@@ -2442,7 +2498,7 @@ function GroupCheckoutSheet({
       ? { latitude: firstAddress.latitude, longitude: firstAddress.longitude, mapsUrl: firstAddress.mapsUrl ?? googleMapsUrl(firstAddress.latitude, firstAddress.longitude), label: firstAddress.label }
       : null,
   );
-  const [receiptUrl, setReceiptUrl] = useState("");
+  const [receiptFile, setReceiptFile] = useState<MobileUploadFile | null>(null);
   const [mapPickerOpen, setMapPickerOpen] = useState(false);
   const [sending, setSending] = useState(false);
   const [error, setError] = useState("");
@@ -2471,7 +2527,7 @@ function GroupCheckoutSheet({
         hostAccessToken,
         orderType,
         paymentMethod,
-        paymentReceiptUrl: paymentMethod === "qr" ? receiptUrl.trim() : undefined,
+        paymentReceiptFile: paymentMethod === "qr" ? receiptFile : null,
         restaurantSlug: restaurant.slug,
       });
       onRecentOrder({
@@ -2534,14 +2590,25 @@ function GroupCheckoutSheet({
               <SegmentButton active={paymentMethod === "cash"} icon={<Banknote color={paymentMethod === "cash" ? colors.blue : colors.muted} size={16} strokeWidth={3} />} onPress={() => setPaymentMethod("cash")} text="Efectivo" />
               <SegmentButton active={paymentMethod === "qr"} icon={<CreditCard color={paymentMethod === "qr" ? colors.blue : colors.muted} size={16} strokeWidth={3} />} onPress={() => setPaymentMethod("qr")} text="QR" />
             </View>
-            {paymentMethod === "qr" ? <InputBox onChangeText={setReceiptUrl} placeholder="Link del comprobante final" value={receiptUrl} /> : null}
+            {paymentMethod === "qr" ? (
+              <UploadPicker
+                description="Captura o imagen del pago final al restaurante."
+                file={receiptFile}
+                label="Comprobante final"
+                onClear={() => setReceiptFile(null)}
+                onPick={async () => {
+                  const file = await pickGroupImageUpload("comprobante-final");
+                  if (file) setReceiptFile(file);
+                }}
+              />
+            ) : null}
             <View style={styles.totalBox}>
               <TotalLine label="Subtotal grupal" value={formatBs(subtotal)} />
               <TotalLine label="Envio" value={formatBs(deliveryFee)} />
               <TotalLine strong label="Total" value={formatBs(total)} />
             </View>
             {error ? <Text style={styles.submitError}>{error}</Text> : null}
-            <PrimaryButton loading={sending} onPress={send} text={sending ? "Enviando..." : "Enviar a caja"} />
+            <PrimaryButton disabled={paymentMethod === "qr" && !receiptFile} loading={sending} onPress={send} text={sending ? "Enviando..." : "Enviar a caja"} />
           </ScrollView>
           {mapPickerOpen ? (
             <MapPickerModal
@@ -5704,6 +5771,41 @@ function SegmentButton({ active, icon, text, onPress }: { active: boolean; icon:
   );
 }
 
+function UploadPicker({
+  description,
+  file,
+  label,
+  onClear,
+  onPick,
+}: {
+  description: string;
+  file: MobileUploadFile | null;
+  label: string;
+  onClear: () => void;
+  onPick: () => void;
+}) {
+  return (
+    <View style={styles.uploadPicker}>
+      <Pressable onPress={onPick} style={({ pressed }) => [styles.uploadPickerButton, pressed && styles.pressedCard]}>
+        <View style={styles.uploadIconBox}>
+          {file ? <Image source={{ uri: file.uri }} style={styles.uploadThumb} /> : <Plus color={colors.blue} size={22} strokeWidth={3.2} />}
+        </View>
+        <View style={styles.uploadPickerBody}>
+          <Text numberOfLines={1} style={styles.uploadPickerLabel}>{file ? file.name : label}</Text>
+          <Text numberOfLines={2} style={styles.uploadPickerText}>{file ? "Listo para subir" : description}</Text>
+        </View>
+        <ArrowRight color={colors.blue} size={20} strokeWidth={3} />
+      </Pressable>
+      {file ? (
+        <Pressable onPress={onClear} style={styles.uploadClearButton}>
+          <X color={colors.danger} size={14} strokeWidth={3} />
+          <Text style={styles.uploadClearText}>Quitar archivo</Text>
+        </Pressable>
+      ) : null}
+    </View>
+  );
+}
+
 function InputBox({
   value,
   placeholder,
@@ -6445,4 +6547,13 @@ const styles = StyleSheet.create({
   totalLine: { alignItems: "center", flexDirection: "row", justifyContent: "space-between" },
   totalStrong: { color: colors.blue, fontSize: 18, fontWeight: "900" },
   totalValue: { color: colors.ink, fontSize: 14, fontWeight: "900" },
+  uploadClearButton: { alignItems: "center", alignSelf: "flex-start", flexDirection: "row", gap: 5, marginTop: 8, minHeight: 32, paddingHorizontal: 4 },
+  uploadClearText: { color: colors.danger, fontSize: 12, fontWeight: "900" },
+  uploadIconBox: { alignItems: "center", backgroundColor: colors.green, borderRadius: 14, height: 46, justifyContent: "center", overflow: "hidden", width: 46 },
+  uploadPicker: { gap: 2 },
+  uploadPickerBody: { flex: 1, minWidth: 0 },
+  uploadPickerButton: { alignItems: "center", backgroundColor: colors.background, borderColor: colors.border, borderRadius: 18, borderWidth: 1, flexDirection: "row", gap: 11, minHeight: 70, padding: 11 },
+  uploadPickerLabel: { color: colors.ink, fontSize: 15, fontWeight: "900" },
+  uploadPickerText: { color: colors.muted, fontSize: 12, fontWeight: "800", lineHeight: 17, marginTop: 2 },
+  uploadThumb: { height: 46, width: 46 },
 });

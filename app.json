@@ -3,7 +3,7 @@
     "name": "yopido.shop",
     "slug": "yopido-shop",
     "scheme": "yopido",
-    "version": "1.1.19",
+    "version": "1.1.20",
     "orientation": "portrait",
     "icon": "./assets/yopido-icon-dark-1024.png",
     "backgroundColor": "#12355B",
@@ -27,7 +27,7 @@
         "android.permission.POST_NOTIFICATIONS"
       ],
       "predictiveBackGestureEnabled": true,
-      "versionCode": 21
+      "versionCode": 22
     },
     "web": {
       "favicon": "./assets/favicon.png"
@@ -43,6 +43,14 @@
           "barcodeScannerEnabled": true,
           "cameraPermission": "Permite que Yopido use la camara para escanear QR grupales.",
           "recordAudioAndroid": false
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Permite que Yopido acceda a tus fotos para subir QR y comprobantes de pago.",
+          "cameraPermission": "Permite que Yopido use la camara para registrar comprobantes de pago.",
+          "microphonePermission": false
         }
       ],
       [

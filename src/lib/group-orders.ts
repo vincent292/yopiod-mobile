@@ -60,6 +60,12 @@ export type MobileGroupOrderResult = {
   trackingToken: string;
 };
 
+export type MobileUploadFile = {
+  uri: string;
+  name: string;
+  type: string;
+};
+
 export class MobileGroupOrderError extends Error {
   code: string;
   status?: number;
@@ -99,15 +105,17 @@ async function requestMobileApi<T>(path: string, options: RequestInit, fallbackC
   const url = apiUrl(path);
   const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
   const timeout = controller ? setTimeout(() => controller.abort(), mobileApiTimeoutMs) : null;
+  const isFormData = typeof FormData !== "undefined" && options.body instanceof FormData;
+  const headers = {
+    ...(isFormData ? {} : { "Content-Type": "application/json" }),
+    ...((options.headers ?? {}) as Record<string, string>),
+  };
 
   let response: Response;
   try {
     response = await fetch(url, {
       ...options,
-      headers: {
-        "Content-Type": "application/json",
-        ...((options.headers ?? {}) as Record<string, string>),
-      },
+      headers,
       signal: controller?.signal,
     });
   } catch (error) {
@@ -124,6 +132,20 @@ async function requestMobileApi<T>(path: string, options: RequestInit, fallbackC
 
 function jsonBody(payload: unknown) {
   return JSON.stringify(payload);
+}
+
+function appendValue(formData: FormData, key: string, value: string | number | boolean | undefined | null) {
+  if (value === undefined || value === null || value === "") return;
+  formData.append(key, String(value));
+}
+
+function appendFile(formData: FormData, key: string, file?: MobileUploadFile | null) {
+  if (!file) return;
+  formData.append(key, {
+    name: file.name,
+    type: file.type || "image/jpeg",
+    uri: file.uri,
+  } as unknown as Blob);
 }
 
 export function groupOrderErrorMessage(error: unknown) {
@@ -150,8 +172,12 @@ export function groupOrderErrorMessage(error: unknown) {
     "product-configuration": "Este producto necesita configuracion.",
     "product-not-found": "Producto no disponible.",
     "qr-required-distance": "Por distancia este pedido requiere pago por QR.",
+    "qr-size": "El QR debe pesar menos de 5 MB.",
+    "qr-type": "El QR debe ser una imagen.",
     "qr-unavailable": "El local no tiene QR configurado.",
-    "receipt-required": "Agrega el enlace del comprobante.",
+    "receipt-required": "Sube el comprobante del pago QR.",
+    "receipt-size": "El comprobante debe pesar menos de 5 MB.",
+    "receipt-type": "El comprobante debe ser imagen o PDF.",
     "service-role-required": "Falta configurar el service role del backend.",
     "temporarily-closed": "El local tiene los pedidos pausados temporalmente.",
   };
@@ -164,10 +190,22 @@ export async function createMobileGroupOrderSession(payload: {
   hostPhone?: string;
   collectMode: GroupCollectMode;
   hostQrUrl?: string;
+  hostQrFile?: MobileUploadFile | null;
 }) {
+  const body = payload.hostQrFile
+    ? (() => {
+        const formData = new FormData();
+        appendValue(formData, "collectMode", payload.collectMode);
+        appendValue(formData, "hostName", payload.hostName);
+        appendValue(formData, "hostPhone", payload.hostPhone);
+        appendValue(formData, "restaurantSlug", payload.restaurantSlug);
+        appendFile(formData, "hostQrFile", payload.hostQrFile);
+        return formData;
+      })()
+    : jsonBody(payload);
   return requestMobileApi<MobileGroupOrderState & { hostAccessToken: string; participantToken: string; sessionToken: string }>(
     "/api/mobile/group-orders",
-    { body: jsonBody(payload), method: "POST" },
+    { body, method: "POST" },
     "create",
   );
 }
@@ -235,11 +273,22 @@ export async function updateMobileGroupParticipantPayment(
     paymentStatus: GroupPaymentStatus;
     paymentNote?: string;
     paymentReceiptUrl?: string;
+    paymentReceiptFile?: MobileUploadFile | null;
   },
 ) {
+  const body = payload.paymentReceiptFile
+    ? (() => {
+        const formData = new FormData();
+        appendValue(formData, "participantToken", payload.participantToken);
+        appendValue(formData, "paymentNote", payload.paymentNote);
+        appendValue(formData, "paymentStatus", payload.paymentStatus);
+        appendFile(formData, "paymentReceiptFile", payload.paymentReceiptFile);
+        return formData;
+      })()
+    : jsonBody(payload);
   return requestMobileApi<MobileGroupOrderState>(
     `/api/mobile/group-orders/${encodeURIComponent(sessionToken)}/payment`,
-    { body: jsonBody(payload), method: "POST" },
+    { body, method: "POST" },
     "payment",
   );
 }
@@ -249,11 +298,21 @@ export async function updateMobileGroupHost(
   payload:
     | { action: "status"; hostAccessToken: string; status: "open" | "locked" | "cancelled" }
     | { action: "participant"; hostAccessToken: string; participantId: string; paymentStatus: GroupPaymentStatus }
-    | { action: "settings"; hostAccessToken: string; collectMode: GroupCollectMode; hostQrUrl?: string },
+    | { action: "settings"; hostAccessToken: string; collectMode: GroupCollectMode; hostQrUrl?: string; hostQrFile?: MobileUploadFile | null },
 ) {
+  const body = payload.action === "settings" && payload.hostQrFile
+    ? (() => {
+        const formData = new FormData();
+        appendValue(formData, "action", payload.action);
+        appendValue(formData, "collectMode", payload.collectMode);
+        appendValue(formData, "hostAccessToken", payload.hostAccessToken);
+        appendFile(formData, "hostQrFile", payload.hostQrFile);
+        return formData;
+      })()
+    : jsonBody(payload);
   return requestMobileApi<MobileGroupOrderState>(
     `/api/mobile/group-orders/${encodeURIComponent(sessionToken)}/host`,
-    { body: jsonBody(payload), method: "POST" },
+    { body, method: "POST" },
     "host",
   );
 }
@@ -274,11 +333,22 @@ export async function submitMobileGroupOrder(
     deliveryCity?: string;
     paymentMethod: "cash" | "qr";
     paymentReceiptUrl?: string;
+    paymentReceiptFile?: MobileUploadFile | null;
   },
 ) {
+  const body = payload.paymentReceiptFile
+    ? (() => {
+        const { paymentReceiptFile, ...submitPayload } = payload;
+        const formData = new FormData();
+        appendValue(formData, "action", "submit");
+        appendValue(formData, "payload", JSON.stringify(submitPayload));
+        appendFile(formData, "paymentReceiptFile", paymentReceiptFile);
+        return formData;
+      })()
+    : jsonBody({ action: "submit", payload });
   const data = await requestMobileApi<{ order: MobileGroupOrderResult }>(
     `/api/mobile/group-orders/${encodeURIComponent(sessionToken)}/host`,
-    { body: jsonBody({ action: "submit", payload }), method: "POST" },
+    { body, method: "POST" },
     "create-order",
   );
   return data.order;
