@@ -5067,7 +5067,7 @@ function MapPickerModal({
                 <NativeMapView
                   initialRegion={region}
                   cacheEnabled={false}
-                  customMapStyle={[]}
+                  googleRenderer={Platform.OS === "android" ? "LEGACY" : undefined}
                   loadingEnabled
                   loadingBackgroundColor={colors.softBlue}
                   loadingIndicatorColor={colors.blue}
