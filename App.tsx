@@ -4972,6 +4972,23 @@ function MapPickerModal({
   const [reference, setReference] = useState("");
   const [buildingName, setBuildingName] = useState("");
   const [formError, setFormError] = useState("");
+  const [mapDebug, setMapDebug] = useState("mounting");
+
+  useEffect(() => {
+    if (!__DEV__) return;
+    const timeout = setTimeout(() => {
+      setMapDebug((current) => current === "loaded" ? current : `${current}:waiting`);
+    }, 4500);
+    return () => clearTimeout(timeout);
+  }, []);
+
+  function noteMapDebug(status: string) {
+    if (!__DEV__) return;
+    const keyState = config.googleMapsApiKey ? `key:${config.googleMapsApiKey.length}` : "key:none";
+    const nextStatus = `${status} ${Platform.OS} ${keyState} native:${NativeMapView ? "yes" : "no"}`;
+    setMapDebug(nextStatus);
+    console.info(`[YopidoMap] ${nextStatus}`);
+  }
 
   function moveMap(nextRegion: typeof region) {
     setRegion(nextRegion);
@@ -5068,7 +5085,7 @@ function MapPickerModal({
             <IconButton light onPress={onClose}><X color={colors.blue} size={22} strokeWidth={3} /></IconButton>
           </View>
           <ScrollView contentContainerStyle={styles.mapPickerContent} keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
-            <View style={[styles.mapPickerCanvas, { height: mapHeight }]}>
+            <View style={[styles.mapPickerCanvas, Platform.OS !== "android" && styles.mapPickerCanvasClipped, { height: mapHeight }]}>
               {NativeMapView ? (
                 <NativeMapView
                   initialRegion={region}
@@ -5079,6 +5096,9 @@ function MapPickerModal({
                   loadingIndicatorColor={colors.blue}
                   mapType="standard"
                   mapPadding={{ bottom: 12, left: 12, right: 12, top: 12 }}
+                  onLayout={() => noteMapDebug("layout")}
+                  onMapLoaded={() => noteMapDebug("loaded")}
+                  onMapReady={() => noteMapDebug("ready")}
                   onPress={(event: any) => placePin(event.nativeEvent.coordinate.latitude, event.nativeEvent.coordinate.longitude)}
                   onRegionChangeComplete={setRegion}
                   pitchEnabled={false}
@@ -5118,6 +5138,11 @@ function MapPickerModal({
               <Pressable disabled={locating} onPress={useCurrentLocation} style={({ pressed }) => [styles.mapLocateButton, pressed && styles.pressedCard]}>
                 {locating ? <ActivityIndicator color={colors.blue} size="small" /> : <Navigation color={colors.blue} size={18} strokeWidth={3} />}
               </Pressable>
+              {__DEV__ ? (
+                <View pointerEvents="none" style={styles.mapDebugBadge}>
+                  <Text numberOfLines={2} style={styles.mapDebugText}>{mapDebug}</Text>
+                </View>
+              ) : null}
             </View>
             <Text style={styles.mapPickerHint}>Arrastra el mapa o toca otro punto hasta que el pin quede sobre tu puerta.</Text>
 
@@ -5798,6 +5823,8 @@ const styles = StyleSheet.create({
   mapActionTextDark: { color: "#FFFFFF", fontSize: 12, fontWeight: "900" },
   mapGridHorizontal: { backgroundColor: "rgba(18,53,91,0.09)", height: 1, left: 0, position: "absolute", right: 0, top: 72 },
   mapGridVertical: { backgroundColor: "rgba(18,53,91,0.09)", bottom: 0, left: 128, position: "absolute", top: 0, width: 1 },
+  mapDebugBadge: { backgroundColor: "rgba(8,36,65,0.88)", borderRadius: 10, bottom: 12, maxWidth: "76%", paddingHorizontal: 9, paddingVertical: 6, position: "absolute", right: 12 },
+  mapDebugText: { color: "#FFFFFF", fontSize: 10, fontWeight: "800", lineHeight: 13 },
   mapLabel: { backgroundColor: "rgba(18,53,91,0.86)", borderRadius: 15, bottom: 10, left: 10, maxWidth: "82%", paddingHorizontal: 12, paddingVertical: 8, position: "absolute" },
   mapLabelText: { color: "#FFFFFFC9", fontSize: 11, fontWeight: "800", marginTop: 1 },
   mapLabelTitle: { color: "#FFFFFF", fontSize: 13, fontWeight: "900" },
@@ -5808,7 +5835,8 @@ const styles = StyleSheet.create({
   mapRoadTwo: { backgroundColor: "rgba(255,255,255,0.76)", borderRadius: 999, height: 18, position: "absolute", right: -20, top: 80, transform: [{ rotate: "18deg" }], width: 230 },
   mapStaticImage: { height: "100%", opacity: 0.92, width: "100%" },
   mapLocateButton: { alignItems: "center", backgroundColor: "#FFFFFF", borderColor: colors.border, borderRadius: 999, borderWidth: 1, bottom: 14, elevation: 4, height: 44, justifyContent: "center", left: 14, position: "absolute", shadowColor: colors.blue, shadowOpacity: 0.14, shadowRadius: 8, width: 44 },
-  mapPickerCanvas: { backgroundColor: colors.softBlue, borderRadius: 20, marginTop: 12, overflow: "hidden" },
+  mapPickerCanvas: { backgroundColor: colors.softBlue, borderRadius: 20, marginTop: 12 },
+  mapPickerCanvasClipped: { overflow: "hidden" },
   mapPickerContent: { paddingBottom: 10 },
   mapPickerHandle: { alignSelf: "center", backgroundColor: colors.border, borderRadius: 999, height: 5, marginBottom: 12, width: 48 },
   mapPickerHeader: { alignItems: "center", flexDirection: "row", justifyContent: "space-between" },
