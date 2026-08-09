@@ -5049,7 +5049,13 @@ function MapPickerModal({
   const mapHeight = Math.min(430, Math.max(330, Math.round(height * (collectAddressDetails ? 0.43 : 0.48))));
 
   return (
-    <Modal transparent animationType="slide" onRequestClose={onClose} visible>
+    <Modal
+      animationType="slide"
+      hardwareAccelerated={Platform.OS === "android"}
+      onRequestClose={onClose}
+      transparent
+      visible
+    >
       <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} style={styles.modalOverlay}>
         <Pressable style={StyleSheet.absoluteFill} onPress={onClose} />
         <SafeAreaView edges={["bottom"]} style={[styles.mapPickerSheet, collectAddressDetails && styles.mapPickerSheetTall]}>

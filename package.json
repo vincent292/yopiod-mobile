@@ -1,6 +1,6 @@
 {
   "name": "yopido-mobile",
-  "version": "1.1.13",
+  "version": "1.1.14",
   "main": "index.ts",
   "dependencies": {
     "@react-native-async-storage/async-storage": "2.2.0",
