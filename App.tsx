@@ -72,6 +72,8 @@ import {
   View,
 } from "react-native";
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
+import { WebView } from "react-native-webview";
+import type { WebViewMessageEvent } from "react-native-webview";
 import { EmptyMessage, FadeInView, IconButton, colors } from "./src/components/ui";
 import { addRecentOrder, loadCustomerStore, saveCustomerStore, upsertSavedAddress } from "./src/lib/customer-store";
 import type { CustomerStore, RecentOrder, SavedAddress, SavedFavorite } from "./src/lib/customer-store";
@@ -230,6 +232,93 @@ function googleStaticMapUrl(latitude: number, longitude: number) {
   if (!config.googleMapsApiKey) return "";
   const marker = `${latitude},${longitude}`;
   return `https://maps.googleapis.com/maps/api/staticmap?center=${marker}&zoom=16&size=640x260&scale=2&maptype=roadmap&markers=color:red%7C${marker}&key=${config.googleMapsApiKey}`;
+}
+
+function clampMapZoom(zoom: number) {
+  return Math.min(19, Math.max(3, zoom));
+}
+
+function leafletZoomFromDelta(latitudeDelta: number) {
+  return clampMapZoom(Math.round(Math.log2(360 / Math.max(latitudeDelta, 0.0001))));
+}
+
+function leafletDeltaFromZoom(zoom: number) {
+  return 360 / (2 ** clampMapZoom(zoom));
+}
+
+function leafletPickerHtml(latitude: number, longitude: number, zoom: number) {
+  return `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    html, body, #map { height: 100%; margin: 0; padding: 0; width: 100%; }
+    body { background: #EAF2FA; overflow: hidden; }
+    .leaflet-control-attribution { font: 9px/1.2 sans-serif; }
+    .leaflet-control-zoom { display: none; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    (function () {
+      function post(payload) {
+        window.ReactNativeWebView && window.ReactNativeWebView.postMessage(JSON.stringify(payload));
+      }
+
+      var map = L.map("map", {
+        attributionControl: true,
+        center: [${latitude}, ${longitude}],
+        zoom: ${clampMapZoom(zoom)},
+        zoomControl: false
+      });
+
+      var tilesLoaded = false;
+      var tiles = L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+        attribution: "OpenStreetMap",
+        maxZoom: 19
+      }).addTo(map);
+
+      function postRegion(type) {
+        var center = map.getCenter();
+        post({ type: type, latitude: center.lat, longitude: center.lng, zoom: map.getZoom() });
+      }
+
+      tiles.on("load", function () {
+        tilesLoaded = true;
+        postRegion("loaded");
+      });
+
+      tiles.on("tileerror", function () {
+        postRegion("tileerror");
+      });
+
+      map.whenReady(function () {
+        postRegion("ready");
+      });
+
+      map.on("moveend", function () {
+        postRegion(tilesLoaded ? "region" : "ready");
+      });
+
+      map.on("click", function (event) {
+        map.setView(event.latlng, map.getZoom(), { animate: true });
+      });
+
+      window.setYopidoMapCenter = function (lat, lng, nextZoom) {
+        map.setView([lat, lng], nextZoom || map.getZoom(), { animate: true });
+      };
+
+      window.zoomYopidoMap = function (direction) {
+        map.setZoom(map.getZoom() + (direction === "in" ? 1 : -1));
+      };
+    })();
+  </script>
+</body>
+</html>`;
 }
 
 function publicRestaurantUrl(slug: string) {
@@ -4960,6 +5049,8 @@ function MapPickerModal({
   const fallbackLatitude = restaurant?.latitude ?? -17.3895;
   const fallbackLongitude = restaurant?.longitude ?? -66.1568;
   const mapRef = useRef<any>(null);
+  const webMapRef = useRef<WebView | null>(null);
+  const useWebMap = Platform.OS === "android";
   const [region, setRegion] = useState({
     latitude: initialLocation?.latitude ?? fallbackLatitude,
     longitude: initialLocation?.longitude ?? fallbackLongitude,
@@ -4973,11 +5064,12 @@ function MapPickerModal({
   const [buildingName, setBuildingName] = useState("");
   const [formError, setFormError] = useState("");
   const [mapDebug, setMapDebug] = useState("mounting");
+  const [mapTouching, setMapTouching] = useState(false);
 
   useEffect(() => {
     if (!__DEV__) return;
     const timeout = setTimeout(() => {
-      setMapDebug((current) => current === "loaded" ? current : `${current}:waiting`);
+      setMapDebug((current) => current.includes("loaded") ? current : `${current}:waiting`);
     }, 4500);
     return () => clearTimeout(timeout);
   }, []);
@@ -4985,13 +5077,19 @@ function MapPickerModal({
   function noteMapDebug(status: string) {
     if (!__DEV__) return;
     const keyState = config.googleMapsApiKey ? `key:${config.googleMapsApiKey.length}` : "key:none";
-    const nextStatus = `${status} ${Platform.OS} ${keyState} native:${NativeMapView ? "yes" : "no"}`;
+    const nextStatus = `${status} ${Platform.OS} ${keyState} engine:${useWebMap ? "web" : "native"}`;
     setMapDebug(nextStatus);
     console.info(`[YopidoMap] ${nextStatus}`);
   }
 
   function moveMap(nextRegion: typeof region) {
     setRegion(nextRegion);
+    if (useWebMap) {
+      webMapRef.current?.injectJavaScript(
+        `window.setYopidoMapCenter && window.setYopidoMapCenter(${nextRegion.latitude}, ${nextRegion.longitude}, ${leafletZoomFromDelta(nextRegion.latitudeDelta)}); true;`,
+      );
+      return;
+    }
     mapRef.current?.animateToRegion(nextRegion, 280);
   }
 
@@ -5014,6 +5112,10 @@ function MapPickerModal({
   }
 
   function changeZoom(direction: "in" | "out") {
+    if (useWebMap) {
+      webMapRef.current?.injectJavaScript(`window.zoomYopidoMap && window.zoomYopidoMap("${direction}"); true;`);
+      return;
+    }
     const factor = direction === "in" ? 0.55 : 1.8;
     moveMap({
       ...region,
@@ -5028,6 +5130,27 @@ function MapPickerModal({
       latitude,
       longitude,
     });
+  }
+
+  function handleWebMapMessage(event: WebViewMessageEvent) {
+    try {
+      const payload = JSON.parse(event.nativeEvent.data) as { latitude?: number; longitude?: number; type?: string; zoom?: number };
+      if (typeof payload.latitude === "number" && typeof payload.longitude === "number") {
+        setRegion((current) => {
+          const delta = typeof payload.zoom === "number" ? leafletDeltaFromZoom(payload.zoom) : current.latitudeDelta;
+          return {
+            ...current,
+            latitude: payload.latitude!,
+            latitudeDelta: delta,
+            longitude: payload.longitude!,
+            longitudeDelta: delta,
+          };
+        });
+      }
+      if (payload.type) noteMapDebug(`web-${payload.type}`);
+    } catch (error) {
+      noteMapDebug("web-message-error");
+    }
   }
 
   async function confirm() {
@@ -5063,6 +5186,10 @@ function MapPickerModal({
   }
 
   const staticUrl = googleStaticMapUrl(region.latitude, region.longitude);
+  const webMapHtml = useMemo(
+    () => leafletPickerHtml(region.latitude, region.longitude, leafletZoomFromDelta(region.latitudeDelta)),
+    [],
+  );
   const mapHeight = Math.min(430, Math.max(330, Math.round(height * (collectAddressDetails ? 0.43 : 0.48))));
 
   return (
@@ -5084,9 +5211,31 @@ function MapPickerModal({
             </View>
             <IconButton light onPress={onClose}><X color={colors.blue} size={22} strokeWidth={3} /></IconButton>
           </View>
-          <ScrollView contentContainerStyle={styles.mapPickerContent} keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
+          <ScrollView contentContainerStyle={styles.mapPickerContent} keyboardShouldPersistTaps="handled" scrollEnabled={!mapTouching} showsVerticalScrollIndicator={false}>
             <View style={[styles.mapPickerCanvas, Platform.OS !== "android" && styles.mapPickerCanvasClipped, { height: mapHeight }]}>
-              {NativeMapView ? (
+              {useWebMap ? (
+                <WebView
+                  ref={webMapRef}
+                  allowsInlineMediaPlayback
+                  domStorageEnabled
+                  javaScriptEnabled
+                  mixedContentMode="always"
+                  nestedScrollEnabled={false}
+                  onError={() => noteMapDebug("webview-error")}
+                  onHttpError={() => noteMapDebug("webview-http-error")}
+                  onLoad={() => noteMapDebug("webview-load")}
+                  onMessage={handleWebMapMessage}
+                  onTouchCancel={() => setMapTouching(false)}
+                  onTouchEnd={() => setMapTouching(false)}
+                  onTouchStart={() => setMapTouching(true)}
+                  originWhitelist={["*"]}
+                  overScrollMode="never"
+                  scrollEnabled={false}
+                  setSupportMultipleWindows={false}
+                  source={{ html: webMapHtml, baseUrl: "https://yopido.shop" }}
+                  style={styles.nativeMap}
+                />
+              ) : NativeMapView ? (
                 <NativeMapView
                   initialRegion={region}
                   cacheEnabled={false}
