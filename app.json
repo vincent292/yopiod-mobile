@@ -3,7 +3,7 @@
     "name": "yopido.shop",
     "slug": "yopido-shop",
     "scheme": "yopido",
-    "version": "1.1.18",
+    "version": "1.1.19",
     "orientation": "portrait",
     "icon": "./assets/yopido-icon-dark-1024.png",
     "backgroundColor": "#12355B",
@@ -27,7 +27,7 @@
         "android.permission.POST_NOTIFICATIONS"
       ],
       "predictiveBackGestureEnabled": true,
-      "versionCode": 20
+      "versionCode": 21
     },
     "web": {
       "favicon": "./assets/favicon.png"

@@ -85,9 +85,9 @@ import { claimCustomerOrders, createCustomerAddress, customerErrorMessage, fetch
 import { signInCustomerWithGoogle } from "./src/lib/auth";
 import { getRestaurantBySlug, listHomeDirectory, listRestaurantBusinessHours, listRestaurantCatalog } from "./src/lib/data";
 import { config } from "./src/lib/config";
-import { clearCache, readCacheEnvelope, writeCache } from "./src/lib/cache";
+import { clearCache, readCache, readCacheEnvelope, writeCache } from "./src/lib/cache";
 import { businessHoursSummary, getBusinessStatus } from "./src/lib/business-hours";
-import { formatDistance } from "./src/lib/distance";
+import { distanceInKm, formatDistance } from "./src/lib/distance";
 import { groupInviteUrl } from "./src/lib/group-invites";
 import type { GroupInviteTarget } from "./src/lib/group-invites";
 import { createMobileOrder, getMobileApiError, getMobileOrderStatus, trackMobileOrder } from "./src/lib/orders";
@@ -233,6 +233,38 @@ function restaurantMapsUrl(restaurant: Pick<RestaurantSummary, "address" | "city
     return googleMapsUrl(restaurant.latitude, restaurant.longitude);
   }
   return googleMapsSearchUrl([restaurant.name, restaurant.address, restaurant.city].filter(Boolean).join(", "));
+}
+
+const savedAddressSnapRadiusKm = 0.3;
+const cachedHomeLocationMaxAgeMs = 12 * 60 * 60 * 1000;
+const lastKnownLocationMaxAgeMs = 5 * 60 * 1000;
+
+function savedAddressToLocation(address: SavedAddress): UserLocation | null {
+  if (!Number.isFinite(address.latitude) || !Number.isFinite(address.longitude)) return null;
+  return {
+    city: address.city || "",
+    latitude: Number(address.latitude),
+    longitude: Number(address.longitude),
+  };
+}
+
+function nearestSavedAddress(location: UserLocation, addresses: SavedAddress[]) {
+  let nearest: { address: SavedAddress; distanceKm: number } | null = null;
+
+  for (const address of addresses) {
+    const addressLocation = savedAddressToLocation(address);
+    if (!addressLocation) continue;
+    const distanceKm = distanceInKm(location, addressLocation);
+    if (!nearest || distanceKm < nearest.distanceKm) {
+      nearest = { address, distanceKm };
+    }
+  }
+
+  return nearest && nearest.distanceKm <= savedAddressSnapRadiusKm ? nearest.address : null;
+}
+
+function locationFromCoordinates(latitude: number, longitude: number, city = ""): UserLocation {
+  return { city, latitude, longitude };
 }
 
 function googleStaticMapUrl(latitude: number, longitude: number) {
@@ -791,7 +823,7 @@ function YopidoApp() {
           sessionUser={sessionUser}
         />
       ) : null}
-      {screen.name !== "restaurant" && screen.name !== "group" && (screen.name !== "home" || activeLocation) ? <BottomNav active={screen.name} onNavigate={(name) => setScreen({ name } as Screen)} /> : null}
+      {screen.name !== "restaurant" && screen.name !== "group" ? <BottomNav active={screen.name} onNavigate={(name) => setScreen({ name } as Screen)} /> : null}
     </SafeAreaProvider>
   );
 }
@@ -834,10 +866,12 @@ function HomeScreen({
   const [groupScannerOpen, setGroupScannerOpen] = useState(false);
   const [currentCity, setCurrentCity] = useState("");
   const [loading, setLoading] = useState(Boolean(activeLocation));
+  const [autoResolvingLocation, setAutoResolvingLocation] = useState(!activeLocation);
   const [refreshing, setRefreshing] = useState(false);
   const [locationLoading, setLocationLoading] = useState(false);
   const [addressSaving, setAddressSaving] = useState(false);
   const [error, setError] = useState("");
+  const autoLocationAttemptRef = useRef(false);
 
   const filtered = useMemo(() => {
     const normalized = query.trim().toLowerCase();
@@ -863,18 +897,28 @@ function HomeScreen({
     ? "Detectando..."
     : activeLocation
       ? currentCity || activeLocation.city || "Ubicacion activa"
-      : "Elegir ubicacion";
+      : autoResolvingLocation
+        ? "Buscando..."
+        : "Elegir ubicacion";
+
+  function applyDirectory(nextDirectory: HomeDirectory, nextLocation?: UserLocation) {
+    setDirectory(nextDirectory);
+    setRestaurants(nextDirectory.restaurants);
+    const resolvedLocation = nextLocation
+      ? {
+          ...nextLocation,
+          city: nextDirectory.activeCity || nextLocation.city || "",
+        }
+      : null;
+    setCurrentCity(resolvedLocation?.city || nextDirectory.activeCity || "");
+    return resolvedLocation;
+  }
 
   async function load(nextLocation: UserLocation) {
     setError("");
     const nextDirectory = await listHomeDirectory(nextLocation);
-    setDirectory(nextDirectory);
-    setRestaurants(nextDirectory.restaurants);
-    const resolvedLocation = {
-      ...nextLocation,
-      city: nextDirectory.activeCity || nextLocation.city || "",
-    };
-    setCurrentCity(resolvedLocation.city || "");
+    const resolvedLocation = applyDirectory(nextDirectory, nextLocation);
+    if (!resolvedLocation) throw new Error("No se pudo resolver la ubicacion.");
     onUseLocation(resolvedLocation);
     await writeCache("home-location", resolvedLocation);
     return nextDirectory;
@@ -885,9 +929,19 @@ function HomeScreen({
     if (!permission.granted) return null;
 
     const current = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
-    const geocode = await Location.reverseGeocodeAsync({ latitude: current.coords.latitude, longitude: current.coords.longitude }).catch(() => []);
+    return locationFromDevicePosition(current);
+  }
+
+  async function locationFromDevicePosition(position: Location.LocationObject) {
+    const rawLocation = locationFromCoordinates(position.coords.latitude, position.coords.longitude);
+    const snappedAddress = nearestSavedAddress(rawLocation, savedAddresses);
+    if (snappedAddress) {
+      return locationFromSavedAddress(snappedAddress);
+    }
+
+    const geocode = await Location.reverseGeocodeAsync({ latitude: position.coords.latitude, longitude: position.coords.longitude }).catch(() => []);
     const city = geocode[0]?.city || geocode[0]?.district || geocode[0]?.subregion || geocode[0]?.region || "";
-    return { latitude: current.coords.latitude, longitude: current.coords.longitude, city };
+    return locationFromCoordinates(position.coords.latitude, position.coords.longitude, city);
   }
 
   async function locationFromSavedAddress(address: SavedAddress) {
@@ -965,19 +1019,22 @@ function HomeScreen({
 
   useEffect(() => {
     if (!activeLocation) {
-      setDirectory({
-        activeCity: "",
-        restaurants: [],
-        mostVisited: [],
-        mostOrderedRestaurants: [],
-        mostOrderedProducts: [],
-        productSuggestions: [],
-      });
-      setRestaurants([]);
-      setCurrentCity("");
-      setLoading(false);
-      setLocationSheetOpen(true);
-      return;
+      let cancelled = false;
+      setLoading(true);
+      setError("");
+      listHomeDirectory()
+        .then((nextDirectory) => {
+          if (!cancelled) applyDirectory(nextDirectory);
+        })
+        .catch((loadError) => {
+          if (!cancelled) setError(loadError instanceof Error ? loadError.message : "No se pudieron cargar restaurantes.");
+        })
+        .finally(() => {
+          if (!cancelled && !autoResolvingLocation) setLoading(false);
+        });
+      return () => {
+        cancelled = true;
+      };
     }
 
     setLoading(true);
@@ -985,6 +1042,77 @@ function HomeScreen({
       .catch((loadError) => setError(loadError instanceof Error ? loadError.message : "No se pudieron cargar restaurantes."))
       .finally(() => setLoading(false));
   }, [activeLocation?.latitude, activeLocation?.longitude]);
+
+  useEffect(() => {
+    if (activeLocation || autoLocationAttemptRef.current) return;
+    autoLocationAttemptRef.current = true;
+
+    let cancelled = false;
+    async function resolveInitialLocation() {
+      setAutoResolvingLocation(true);
+      setLoading(true);
+      setError("");
+
+      try {
+        const cachedLocation = await readCache<UserLocation>("home-location", cachedHomeLocationMaxAgeMs);
+        if (cancelled) return;
+        if (cachedLocation) {
+          await load(cachedLocation);
+        }
+
+        const permission = await Location.getForegroundPermissionsAsync();
+        if (cancelled || !permission.granted) return;
+
+        const lastKnown = await Location.getLastKnownPositionAsync({
+          maxAge: lastKnownLocationMaxAgeMs,
+          requiredAccuracy: 500,
+        });
+        if (cancelled) return;
+        if (lastKnown) {
+          const quickLocation = await locationFromDevicePosition(lastKnown);
+          if (quickLocation && !cancelled) await load(quickLocation);
+        }
+
+        const current = await Location.getCurrentPositionAsync({
+          accuracy: Location.Accuracy.Balanced,
+          mayShowUserSettingsDialog: false,
+        });
+        if (cancelled) return;
+        const nextLocation = await locationFromDevicePosition(current);
+        if (nextLocation && !cancelled) await load(nextLocation);
+      } catch {
+        if (!cancelled) setError("");
+      } finally {
+        if (!cancelled) {
+          setAutoResolvingLocation(false);
+          setLoading(false);
+        }
+      }
+    }
+
+    void resolveInitialLocation();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeLocation?.latitude, activeLocation?.longitude, savedAddresses.length]);
+
+  useEffect(() => {
+    if (!activeLocation || !savedAddresses.length) return;
+    const snappedAddress = nearestSavedAddress(activeLocation, savedAddresses);
+    const snappedLocation = snappedAddress ? savedAddressToLocation(snappedAddress) : null;
+    if (!snappedAddress || !snappedLocation || distanceInKm(activeLocation, snappedLocation) < 0.02) return;
+
+    let cancelled = false;
+    locationFromSavedAddress(snappedAddress)
+      .then((nextLocation) => {
+        if (!cancelled && nextLocation) void load(nextLocation);
+      })
+      .catch(() => undefined);
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeLocation?.latitude, activeLocation?.longitude, savedAddresses.length]);
 
   async function saveAddressFromMap(location: DeliveryLocation, details?: AddressDetails) {
     setAddressSaving(true);
@@ -1081,7 +1209,7 @@ function HomeScreen({
               ) : null}
             </View>
 
-            {activeLocation ? (
+            {activeLocation || restaurants.length ? (
               <View style={styles.bodyTop}>
                 <SectionTitle eyebrow="Explorar" title="Encuentra tu negocio" />
                 <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.businessRail}>
@@ -1093,7 +1221,7 @@ function HomeScreen({
                 </ScrollView>
 
                 <View style={styles.resultsHeader}>
-                  <SectionTitle eyebrow="Resultados" title={`Negocios en ${currentCity || "tu ciudad"}`} />
+                  <SectionTitle eyebrow="Resultados" title={activeLocation ? `Negocios en ${currentCity || "tu ciudad"}` : "Negocios disponibles"} />
                   <View style={styles.resultsCount}>
                     <Text style={styles.resultsCountText}>{filtered.length} negocios</Text>
                   </View>
@@ -1118,7 +1246,7 @@ function HomeScreen({
           </FadeInView>
         )}
         ListFooterComponent={
-          activeLocation ? (
+          activeLocation || restaurants.length ? (
             <HomeFooter
               mostOrderedProducts={directory.mostOrderedProducts.length ? directory.mostOrderedProducts : directory.productSuggestions.slice(0, 8)}
               mostOrderedRestaurants={directory.mostOrderedRestaurants.length ? directory.mostOrderedRestaurants : restaurants.slice(0, 4)}
