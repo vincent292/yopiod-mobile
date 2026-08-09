@@ -1,6 +1,4 @@
 import * as Location from "expo-location";
-import { CameraView, useCameraPermissions } from "expo-camera";
-import type { BarcodeScanningResult } from "expo-camera";
 import { LinearGradient } from "expo-linear-gradient";
 import { StatusBar as ExpoStatusBar } from "expo-status-bar";
 import {
@@ -80,6 +78,7 @@ import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 import { WebView } from "react-native-webview";
 import type { WebViewMessageEvent } from "react-native-webview";
 import { EmptyMessage, FadeInView, IconButton, colors } from "./src/components/ui";
+import { GroupQrScannerModal } from "./src/features/group-orders/GroupQrScannerModal";
 import { addRecentOrder, loadCustomerStore, saveCustomerStore, upsertSavedAddress } from "./src/lib/customer-store";
 import type { CustomerStore, RecentOrder, SavedAddress, SavedFavorite } from "./src/lib/customer-store";
 import { claimCustomerOrders, createCustomerAddress, customerErrorMessage, fetchCustomerAccount, mapCustomerAddressToSavedAddress, mapCustomerOrderToRecentOrder, registerCustomerAccount, setCustomerFavorite, signInCustomerAccount, updateCustomerProfile } from "./src/lib/customers";
@@ -89,6 +88,8 @@ import { config } from "./src/lib/config";
 import { clearCache, readCacheEnvelope, writeCache } from "./src/lib/cache";
 import { businessHoursSummary, getBusinessStatus } from "./src/lib/business-hours";
 import { formatDistance } from "./src/lib/distance";
+import { groupInviteUrl } from "./src/lib/group-invites";
+import type { GroupInviteTarget } from "./src/lib/group-invites";
 import { createMobileOrder, getMobileApiError, getMobileOrderStatus, trackMobileOrder } from "./src/lib/orders";
 import type { MobileOrderQueueState, MobileOrderStatus, MobileOrderType, MobileTrackedOrder, MobileTrackingResult } from "./src/lib/orders";
 import {
@@ -134,7 +135,6 @@ type AccountPanelView = "home" | "addresses" | "orders" | "favorites" | "help";
 type OrderHistoryFilter = "all" | "delivery" | "pickup";
 type FavoriteFilter = "all" | "restaurant" | "product";
 type NotificationStatus = "checking" | "disabled" | "error" | "ready" | "unknown";
-type GroupInviteTarget = { restaurantSlug?: string; sessionToken: string };
 type GroupOpenTokens = { restaurantSlug?: string; sessionToken?: string; hostAccessToken?: string; participantToken?: string };
 type BusinessType = {
   value: string;
@@ -331,34 +331,6 @@ function leafletPickerHtml(latitude: number, longitude: number, zoom: number) {
 
 function publicRestaurantUrl(slug: string) {
   return `https://yopido.shop/${slug}`;
-}
-
-function groupInviteUrl(restaurantSlug: string, sessionToken: string) {
-  return `${config.apiBaseUrl.replace(/\/$/, "")}/r/${restaurantSlug}/grupo/${sessionToken}`;
-}
-
-function parseGroupInvite(value: string): GroupInviteTarget | null {
-  const clean = value.trim();
-  if (!clean) return null;
-
-  try {
-    const url = new URL(clean);
-    const segments = url.pathname.split("/").filter(Boolean);
-    const groupIndex = segments.findIndex((segment) => segment === "grupo");
-    if (groupIndex >= 0 && segments[groupIndex + 1]) {
-      const restaurantSlug = segments[groupIndex - 1] && segments[groupIndex - 2] === "r" ? segments[groupIndex - 1] : undefined;
-      return { restaurantSlug, sessionToken: decodeURIComponent(segments[groupIndex + 1]) };
-    }
-    const queryToken = url.searchParams.get("sessionToken") || url.searchParams.get("session") || url.searchParams.get("token");
-    if (queryToken) {
-      return { restaurantSlug: url.searchParams.get("restaurantSlug") || undefined, sessionToken: queryToken };
-    }
-  } catch {
-    // Plain session codes are supported when scanning from a restaurant.
-  }
-
-  if (/^[A-Za-z0-9_-]{4,64}$/.test(clean)) return { sessionToken: clean };
-  return null;
 }
 
 async function shareRestaurant(restaurant: RestaurantSummary) {
@@ -1049,81 +1021,6 @@ function HomeScreen({
     }
   }
 
-  if (!activeLocation) {
-    return (
-      <SafeAreaView edges={["top"]} style={styles.safeBlue}>
-        <View style={styles.locationGate}>
-          <Image resizeMode="contain" source={logoDark} style={styles.locationGateLogo} />
-          <View style={styles.locationGateCard}>
-            <View style={styles.locationRequiredIcon}>
-              <MapPin color={colors.blue} size={26} strokeWidth={2.6} />
-            </View>
-            <Text style={styles.locationRequiredTitle}>Donde quieres pedir</Text>
-            <Text style={styles.locationRequiredText}>Elige una ubicacion para mostrar locales, distancias y negocios cercanos.</Text>
-            {error ? <Text style={styles.locationSheetError}>{error}</Text> : null}
-            <Pressable disabled={locationLoading} onPress={requestLocation} style={({ pressed }) => [styles.locationRequiredButton, locationLoading && styles.primaryButtonDisabled, pressed && !locationLoading && styles.pressedCard]}>
-              <Navigation color={colors.blue} size={17} strokeWidth={2.8} />
-              <Text style={styles.locationRequiredButtonText}>{locationLoading ? "Detectando..." : "Usar mi ubicacion"}</Text>
-            </Pressable>
-            <Pressable onPress={() => setGroupScannerOpen(true)} style={({ pressed }) => [styles.locationGateSecondaryButton, pressed && styles.pressedCard]}>
-              <ScanLine color={colors.blue} size={17} strokeWidth={2.8} />
-              <Text style={styles.locationGateSecondaryText}>Escanear QR grupal</Text>
-            </Pressable>
-            {savedAddresses.length ? (
-              <Pressable onPress={() => setLocationSheetOpen(true)} style={({ pressed }) => [styles.locationGateSecondaryButton, pressed && styles.pressedCard]}>
-                <MapPin color={colors.blue} size={17} strokeWidth={2.6} />
-                <Text style={styles.locationGateSecondaryText}>Ver ubicaciones guardadas</Text>
-              </Pressable>
-            ) : canSaveAddress ? (
-              <Pressable onPress={() => setAddressPickerOpen(true)} style={({ pressed }) => [styles.locationGateSecondaryButton, pressed && styles.pressedCard]}>
-                <Plus color={colors.blue} size={17} strokeWidth={2.8} />
-                <Text style={styles.locationGateSecondaryText}>Agregar nueva direccion</Text>
-              </Pressable>
-            ) : null}
-          </View>
-        </View>
-        {locationSheetOpen ? (
-          <LocationSheet
-            currentCity={currentCity}
-            currentLocation={activeLocation}
-            error={error}
-            loading={locationLoading}
-            canAddAddress={canSaveAddress}
-            onAddAddress={() => {
-              setLocationSheetOpen(false);
-              setAddressPickerOpen(true);
-            }}
-            onClose={() => undefined}
-            onSelectAddress={selectSavedAddress}
-            onUseCurrentLocation={requestLocation}
-            savedAddresses={savedAddresses}
-          />
-        ) : null}
-        {addressPickerOpen ? (
-          <MapPickerModal
-            collectAddressDetails
-            initialLocation={null}
-            onClose={() => {
-              setAddressPickerOpen(false);
-              setLocationSheetOpen(true);
-            }}
-            onConfirm={saveAddressFromMap}
-            saving={addressSaving}
-          />
-        ) : null}
-        {groupScannerOpen ? (
-          <GroupQrScannerModal
-            onClose={() => setGroupScannerOpen(false)}
-            onScanned={(target) => {
-              setGroupScannerOpen(false);
-              onOpenGroupInvite(target);
-            }}
-          />
-        ) : null}
-      </SafeAreaView>
-    );
-  }
-
   return (
     <SafeAreaView edges={["top"]} style={styles.safeBlue}>
       <FlatList
@@ -1235,7 +1132,7 @@ function HomeScreen({
             ? <HomeSkeleton />
             : activeLocation
               ? <EmptyMessage description={`Todavia no hay negocios disponibles en ${currentCity || "esta ciudad"}.`} title="Sin negocios en tu ciudad" />
-              : <LocationRequired onPress={() => setLocationSheetOpen(true)} />
+              : null
         }
       />
       {searchOpen ? (
@@ -3844,22 +3741,6 @@ function PopularProductsSection({ products, onOpenRestaurant }: { products: Popu
   );
 }
 
-function LocationRequired({ onPress }: { onPress: () => void }) {
-  return (
-    <View style={styles.locationRequired}>
-      <View style={styles.locationRequiredIcon}>
-        <MapPin color={colors.blue} size={26} strokeWidth={3} />
-      </View>
-      <Text style={styles.locationRequiredTitle}>Elige tu ubicacion</Text>
-      <Text style={styles.locationRequiredText}>Selecciona tu punto actual o una direccion guardada.</Text>
-      <Pressable onPress={onPress} style={({ pressed }) => [styles.locationRequiredButton, pressed && styles.pressedCard]}>
-        <Navigation color={colors.blue} size={17} strokeWidth={3} />
-        <Text style={styles.locationRequiredButtonText}>Seleccionar ubicacion</Text>
-      </Pressable>
-    </View>
-  );
-}
-
 function LocationSheet({
   canAddAddress,
   currentCity,
@@ -5172,85 +5053,6 @@ function BusinessHoursModal({ hours, onClose, statusText }: { hours: BusinessHou
   );
 }
 
-function GroupQrScannerModal({
-  fallbackRestaurantSlug,
-  onClose,
-  onScanned,
-}: {
-  fallbackRestaurantSlug?: string;
-  onClose: () => void;
-  onScanned: (target: GroupInviteTarget) => void;
-}) {
-  const [permission, requestPermission] = useCameraPermissions();
-  const [scanned, setScanned] = useState(false);
-  const [error, setError] = useState("");
-
-  useEffect(() => {
-    if (permission && !permission.granted && permission.canAskAgain) {
-      void requestPermission();
-    }
-  }, [permission?.granted, permission?.canAskAgain]);
-
-  function handleBarcodeScanned(result: BarcodeScanningResult) {
-    if (scanned) return;
-    const target = parseGroupInvite(result.data);
-    if (!target) {
-      setError("Este QR no parece ser de un Yopido Grupal.");
-      setScanned(true);
-      setTimeout(() => setScanned(false), 1400);
-      return;
-    }
-
-    onScanned({
-      restaurantSlug: target.restaurantSlug ?? fallbackRestaurantSlug,
-      sessionToken: target.sessionToken,
-    });
-  }
-
-  return (
-    <Modal animationType="slide" onRequestClose={onClose} transparent visible>
-      <View style={styles.scannerOverlay}>
-        <SafeAreaView edges={["top", "bottom"]} style={styles.scannerSheet}>
-          <View style={styles.scannerHeader}>
-            <View>
-              <Text style={styles.cartSheetEyebrow}>Yopido Grupal</Text>
-              <Text style={styles.scannerTitle}>Escanear QR</Text>
-            </View>
-            <IconButton light onPress={onClose}><X color={colors.blue} size={22} strokeWidth={3} /></IconButton>
-          </View>
-          <View style={styles.scannerCameraWrap}>
-            {permission?.granted ? (
-              <CameraView
-                barcodeScannerSettings={{ barcodeTypes: ["qr"] }}
-                facing="back"
-                onBarcodeScanned={scanned ? undefined : handleBarcodeScanned}
-                style={styles.scannerCamera}
-              />
-            ) : (
-              <View style={styles.scannerPermissionBox}>
-                <ScanLine color={colors.blue} size={34} strokeWidth={2.8} />
-                <Text style={styles.scannerPermissionTitle}>Permiso de camara</Text>
-                <Text style={styles.scannerPermissionText}>Activa la camara para leer el QR de la sala grupal.</Text>
-                <PrimaryButton onPress={requestPermission} text="Permitir camara" />
-              </View>
-            )}
-            {permission?.granted ? (
-              <View pointerEvents="none" style={styles.scannerFrame}>
-                <View style={styles.scannerFrameCornerTopLeft} />
-                <View style={styles.scannerFrameCornerTopRight} />
-                <View style={styles.scannerFrameCornerBottomLeft} />
-                <View style={styles.scannerFrameCornerBottomRight} />
-              </View>
-            ) : null}
-          </View>
-          <Text style={styles.scannerHint}>Apunta al QR del Yopido Grupal. Tambien acepta links compartidos desde la web.</Text>
-          {error ? <Text style={styles.submitError}>{error}</Text> : null}
-        </SafeAreaView>
-      </View>
-    </Modal>
-  );
-}
-
 function ReviewLine({ label, value }: { label: string; value: string }) {
   return (
     <View style={styles.reviewSummaryLine}>
@@ -6129,11 +5931,6 @@ const styles = StyleSheet.create({
   locationActiveCheck: { alignItems: "center", backgroundColor: colors.green, borderRadius: 999, height: 28, justifyContent: "center", width: 28 },
   locationAddButton: { alignItems: "center", backgroundColor: colors.green, borderRadius: 999, flexDirection: "row", gap: 5, minHeight: 36, paddingHorizontal: 12 },
   locationAddButtonText: { color: colors.blue, fontSize: 12, fontWeight: "900" },
-  locationGate: { backgroundColor: colors.blue, flex: 1, justifyContent: "center", padding: 18 },
-  locationGateCard: { alignItems: "center", backgroundColor: "#FFFFFF", borderColor: "rgba(255,255,255,0.22)", borderRadius: 26, borderWidth: 1, gap: 9, padding: 20, shadowColor: colors.blue, shadowOpacity: 0.18, shadowRadius: 18 },
-  locationGateLogo: { alignSelf: "center", height: 42, marginBottom: 18, width: 190 },
-  locationGateSecondaryButton: { alignItems: "center", backgroundColor: colors.softBlue, borderColor: colors.border, borderRadius: 999, borderWidth: 1, flexDirection: "row", gap: 7, marginTop: 2, minHeight: 44, paddingHorizontal: 16 },
-  locationGateSecondaryText: { color: colors.blue, fontSize: 13, fontWeight: "900" },
   locationOrderBody: { flex: 1, minWidth: 0 },
   locationOrderButton: { alignItems: "center", backgroundColor: colors.softBlue, borderColor: colors.border, borderRadius: 18, borderWidth: 1, flexDirection: "row", gap: 11, marginTop: 10, padding: 12 },
   locationOrderIcon: { alignItems: "center", backgroundColor: "#FFFFFF", borderRadius: 15, height: 42, justifyContent: "center", width: 42 },
@@ -6147,12 +5944,6 @@ const styles = StyleSheet.create({
   locationOptionRow: { alignItems: "center", borderBottomColor: colors.border, borderBottomWidth: 1, flexDirection: "row", gap: 11, minHeight: 68, paddingHorizontal: 2, paddingVertical: 10 },
   locationOptionText: { color: colors.muted, fontSize: 12, fontWeight: "800", marginTop: 3 },
   locationOptionTitle: { color: colors.blue, fontSize: 15, fontWeight: "900" },
-  locationRequired: { alignItems: "center", gap: 8, marginHorizontal: 20, paddingHorizontal: 18, paddingVertical: 34 },
-  locationRequiredButton: { alignItems: "center", backgroundColor: colors.green, borderRadius: 999, flexDirection: "row", gap: 7, marginTop: 8, minHeight: 46, paddingHorizontal: 18 },
-  locationRequiredButtonText: { color: colors.blue, fontSize: 13, fontWeight: "900" },
-  locationRequiredIcon: { alignItems: "center", backgroundColor: colors.softBlue, borderRadius: 18, height: 54, justifyContent: "center", width: 54 },
-  locationRequiredText: { color: colors.muted, fontSize: 13, fontWeight: "800", lineHeight: 19, textAlign: "center" },
-  locationRequiredTitle: { color: colors.ink, fontSize: 19, fontWeight: "900" },
   locationSavedEmpty: { alignItems: "center", flexDirection: "row", gap: 9, paddingHorizontal: 4, paddingVertical: 22 },
   locationSavedEmptyText: { color: colors.muted, flex: 1, fontSize: 13, fontWeight: "800" },
   locationSavedHeader: { alignItems: "center", flexDirection: "row", justifyContent: "space-between", marginBottom: 2, marginTop: 4 },
@@ -6379,21 +6170,6 @@ const styles = StyleSheet.create({
   searchSheetTitle: { color: colors.ink, fontSize: 24, fontWeight: "900", marginTop: 2 },
   searchShell: { alignItems: "center", backgroundColor: "#FFFFFF", borderRadius: 22, flexDirection: "row", gap: 10, marginHorizontal: 14, marginTop: 14, minHeight: 54, paddingLeft: 18, paddingRight: 5 },
   searchValue: { color: colors.ink },
-  scannerCamera: { height: "100%", width: "100%" },
-  scannerCameraWrap: { backgroundColor: "#081B2F", borderRadius: 24, height: 360, marginTop: 16, overflow: "hidden", position: "relative" },
-  scannerFrame: { borderColor: "rgba(255,255,255,0.22)", borderRadius: 26, borderWidth: 1, height: 220, left: "50%", marginLeft: -110, marginTop: -110, position: "absolute", top: "50%", width: 220 },
-  scannerFrameCornerBottomLeft: { borderBottomColor: colors.green, borderLeftColor: colors.green, borderBottomWidth: 5, borderLeftWidth: 5, borderRadius: 7, bottom: -1, height: 42, left: -1, position: "absolute", width: 42 },
-  scannerFrameCornerBottomRight: { borderBottomColor: colors.green, borderRightColor: colors.green, borderBottomWidth: 5, borderRightWidth: 5, borderRadius: 7, bottom: -1, height: 42, position: "absolute", right: -1, width: 42 },
-  scannerFrameCornerTopLeft: { borderLeftColor: colors.green, borderTopColor: colors.green, borderLeftWidth: 5, borderTopWidth: 5, borderRadius: 7, height: 42, left: -1, position: "absolute", top: -1, width: 42 },
-  scannerFrameCornerTopRight: { borderRightColor: colors.green, borderTopColor: colors.green, borderRightWidth: 5, borderTopWidth: 5, borderRadius: 7, height: 42, position: "absolute", right: -1, top: -1, width: 42 },
-  scannerHeader: { alignItems: "center", flexDirection: "row", justifyContent: "space-between" },
-  scannerHint: { color: colors.muted, fontSize: 12, fontWeight: "800", lineHeight: 18, marginTop: 12, textAlign: "center" },
-  scannerOverlay: { backgroundColor: "rgba(8,36,65,0.64)", flex: 1, justifyContent: "flex-end" },
-  scannerPermissionBox: { alignItems: "center", backgroundColor: colors.surface, flex: 1, gap: 10, justifyContent: "center", padding: 24 },
-  scannerPermissionText: { color: colors.muted, fontSize: 13, fontWeight: "800", lineHeight: 19, textAlign: "center" },
-  scannerPermissionTitle: { color: colors.ink, fontSize: 19, fontWeight: "900" },
-  scannerSheet: { backgroundColor: colors.surface, borderTopLeftRadius: 28, borderTopRightRadius: 28, padding: 18 },
-  scannerTitle: { color: colors.ink, fontSize: 24, fontWeight: "900", marginTop: 2 },
   sectionHeader: { alignItems: "center", flexDirection: "row", justifyContent: "space-between" },
   segmentButton: { alignItems: "center", backgroundColor: "#FFFFFF", borderColor: colors.border, borderRadius: 999, borderWidth: 1, flex: 1, flexDirection: "row", gap: 7, justifyContent: "center", minHeight: 43 },
   segmentButtonActive: { backgroundColor: colors.softBlue, borderColor: colors.green },
