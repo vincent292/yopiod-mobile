@@ -1,4 +1,6 @@
 import * as Location from "expo-location";
+import { CameraView, useCameraPermissions } from "expo-camera";
+import type { BarcodeScanningResult } from "expo-camera";
 import { LinearGradient } from "expo-linear-gradient";
 import { StatusBar as ExpoStatusBar } from "expo-status-bar";
 import {
@@ -32,7 +34,9 @@ import {
   PackageCheck,
   Phone,
   Plus,
+  QrCode,
   ReceiptText,
+  ScanLine,
   Search,
   Send,
   Share2,
@@ -71,6 +75,7 @@ import {
   useWindowDimensions,
   View,
 } from "react-native";
+import QRCode from "qrcode";
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 import { WebView } from "react-native-webview";
 import type { WebViewMessageEvent } from "react-native-webview";
@@ -129,6 +134,8 @@ type AccountPanelView = "home" | "addresses" | "orders" | "favorites" | "help";
 type OrderHistoryFilter = "all" | "delivery" | "pickup";
 type FavoriteFilter = "all" | "restaurant" | "product";
 type NotificationStatus = "checking" | "disabled" | "error" | "ready" | "unknown";
+type GroupInviteTarget = { restaurantSlug?: string; sessionToken: string };
+type GroupOpenTokens = { restaurantSlug?: string; sessionToken?: string; hostAccessToken?: string; participantToken?: string };
 type BusinessType = {
   value: string;
   label: string;
@@ -255,9 +262,10 @@ function leafletPickerHtml(latitude: number, longitude: number, zoom: number) {
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <style>
     html, body, #map { height: 100%; margin: 0; padding: 0; width: 100%; }
-    body { background: #EAF2FA; overflow: hidden; }
-    .leaflet-control-attribution { font: 9px/1.2 sans-serif; }
+    body { background: #F5F8FB; overflow: hidden; }
+    .leaflet-control-attribution { background: rgba(255,255,255,0.72); color: #536173; font: 9px/1.2 sans-serif; }
     .leaflet-control-zoom { display: none; }
+    .leaflet-tile-pane { filter: saturate(1.06) contrast(1.02); }
   </style>
 </head>
 <body>
@@ -277,8 +285,8 @@ function leafletPickerHtml(latitude: number, longitude: number, zoom: number) {
       });
 
       var tilesLoaded = false;
-      var tiles = L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-        attribution: "OpenStreetMap",
+      var tiles = L.tileLayer("https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png", {
+        attribution: "OpenStreetMap, CARTO",
         maxZoom: 19
       }).addTo(map);
 
@@ -323,6 +331,34 @@ function leafletPickerHtml(latitude: number, longitude: number, zoom: number) {
 
 function publicRestaurantUrl(slug: string) {
   return `https://yopido.shop/${slug}`;
+}
+
+function groupInviteUrl(restaurantSlug: string, sessionToken: string) {
+  return `${config.apiBaseUrl.replace(/\/$/, "")}/r/${restaurantSlug}/grupo/${sessionToken}`;
+}
+
+function parseGroupInvite(value: string): GroupInviteTarget | null {
+  const clean = value.trim();
+  if (!clean) return null;
+
+  try {
+    const url = new URL(clean);
+    const segments = url.pathname.split("/").filter(Boolean);
+    const groupIndex = segments.findIndex((segment) => segment === "grupo");
+    if (groupIndex >= 0 && segments[groupIndex + 1]) {
+      const restaurantSlug = segments[groupIndex - 1] && segments[groupIndex - 2] === "r" ? segments[groupIndex - 1] : undefined;
+      return { restaurantSlug, sessionToken: decodeURIComponent(segments[groupIndex + 1]) };
+    }
+    const queryToken = url.searchParams.get("sessionToken") || url.searchParams.get("session") || url.searchParams.get("token");
+    if (queryToken) {
+      return { restaurantSlug: url.searchParams.get("restaurantSlug") || undefined, sessionToken: queryToken };
+    }
+  } catch {
+    // Plain session codes are supported when scanning from a restaurant.
+  }
+
+  if (/^[A-Za-z0-9_-]{4,64}$/.test(clean)) return { sessionToken: clean };
+  return null;
 }
 
 async function shareRestaurant(restaurant: RestaurantSummary) {
@@ -714,6 +750,13 @@ function YopidoApp() {
           activeLocation={activeLocation}
           canSaveAddress={Boolean(sessionUser?.accessToken)}
           favorites={customerStore.favorites}
+          onOpenGroupInvite={(target) => {
+            if (!target.restaurantSlug) {
+              Alert.alert("QR grupal", "Este QR no incluye el local. Escanealo desde el restaurante o comparte el link completo.");
+              return;
+            }
+            setScreen({ name: "group", restaurantSlug: target.restaurantSlug, sessionToken: target.sessionToken });
+          }}
           onOpenRestaurant={(slug) => setScreen({ name: "restaurant", slug })}
           onSaveAddress={handleSavedAddress}
           onToggleFavorite={handleToggleFavorite}
@@ -726,7 +769,7 @@ function YopidoApp() {
           customerAccessToken={sessionUser?.accessToken}
           customerStore={customerStore}
           onBack={() => setScreen({ name: "home" })}
-          onOpenGroupOrder={(tokens) => setScreen({ name: "group", restaurantSlug: screen.slug, ...tokens })}
+          onOpenGroupOrder={(tokens) => setScreen({ name: "group", restaurantSlug: tokens?.restaurantSlug ?? screen.slug, ...tokens })}
           onRecentOrder={handleRecentOrder}
           onSavedAddress={handleSavedAddress}
           onToggleFavorite={handleToggleFavorite}
@@ -785,6 +828,7 @@ function HomeScreen({
   activeLocation,
   canSaveAddress,
   favorites,
+  onOpenGroupInvite,
   onOpenRestaurant,
   onSaveAddress,
   onToggleFavorite,
@@ -794,6 +838,7 @@ function HomeScreen({
   activeLocation?: UserLocation;
   canSaveAddress: boolean;
   favorites: SavedFavorite[];
+  onOpenGroupInvite: (target: GroupInviteTarget) => void;
   onOpenRestaurant: (slug: string) => void;
   onSaveAddress: (address: Omit<SavedAddress, "id" | "updatedAt">) => Promise<SavedAddress[]>;
   onToggleFavorite: (favorite: SavedFavorite) => void | Promise<void>;
@@ -814,6 +859,7 @@ function HomeScreen({
   const [searchOpen, setSearchOpen] = useState(false);
   const [locationSheetOpen, setLocationSheetOpen] = useState(false);
   const [addressPickerOpen, setAddressPickerOpen] = useState(false);
+  const [groupScannerOpen, setGroupScannerOpen] = useState(false);
   const [currentCity, setCurrentCity] = useState("");
   const [loading, setLoading] = useState(Boolean(activeLocation));
   const [refreshing, setRefreshing] = useState(false);
@@ -1019,6 +1065,10 @@ function HomeScreen({
               <Navigation color={colors.blue} size={17} strokeWidth={2.8} />
               <Text style={styles.locationRequiredButtonText}>{locationLoading ? "Detectando..." : "Usar mi ubicacion"}</Text>
             </Pressable>
+            <Pressable onPress={() => setGroupScannerOpen(true)} style={({ pressed }) => [styles.locationGateSecondaryButton, pressed && styles.pressedCard]}>
+              <ScanLine color={colors.blue} size={17} strokeWidth={2.8} />
+              <Text style={styles.locationGateSecondaryText}>Escanear QR grupal</Text>
+            </Pressable>
             {savedAddresses.length ? (
               <Pressable onPress={() => setLocationSheetOpen(true)} style={({ pressed }) => [styles.locationGateSecondaryButton, pressed && styles.pressedCard]}>
                 <MapPin color={colors.blue} size={17} strokeWidth={2.6} />
@@ -1061,6 +1111,15 @@ function HomeScreen({
             saving={addressSaving}
           />
         ) : null}
+        {groupScannerOpen ? (
+          <GroupQrScannerModal
+            onClose={() => setGroupScannerOpen(false)}
+            onScanned={(target) => {
+              setGroupScannerOpen(false);
+              onOpenGroupInvite(target);
+            }}
+          />
+        ) : null}
       </SafeAreaView>
     );
   }
@@ -1094,6 +1153,10 @@ function HomeScreen({
                 <View style={styles.searchButton}>
                   <Search color={colors.blue} size={23} strokeWidth={2.6} />
                 </View>
+              </Pressable>
+              <Pressable onPress={() => setGroupScannerOpen(true)} style={({ pressed }) => [styles.groupScanHeroButton, pressed && styles.pressedCard]}>
+                <ScanLine color={colors.blue} size={18} strokeWidth={3} />
+                <Text style={styles.groupScanHeroText}>Escanear QR grupal</Text>
               </Pressable>
 
               {featured.length ? (
@@ -1218,6 +1281,15 @@ function HomeScreen({
           saving={addressSaving}
         />
       ) : null}
+      {groupScannerOpen ? (
+        <GroupQrScannerModal
+          onClose={() => setGroupScannerOpen(false)}
+          onScanned={(target) => {
+            setGroupScannerOpen(false);
+            onOpenGroupInvite(target);
+          }}
+        />
+      ) : null}
     </SafeAreaView>
   );
 }
@@ -1238,7 +1310,7 @@ function RestaurantScreen({
   customerAccessToken?: string;
   customerStore: CustomerStore;
   onBack: () => void;
-  onOpenGroupOrder: (tokens?: { sessionToken?: string; hostAccessToken?: string; participantToken?: string }) => void;
+  onOpenGroupOrder: (tokens?: GroupOpenTokens) => void;
   onRecentOrder: (order: RecentOrder) => void;
   onSavedAddress: (address: Omit<SavedAddress, "id" | "updatedAt">) => void;
   onToggleFavorite: (favorite: SavedFavorite) => void | Promise<void>;
@@ -1680,7 +1752,7 @@ function GroupOrderStartSheet({
   customerStore: CustomerStore;
   restaurant: RestaurantSummary;
   onClose: () => void;
-  onOpenGroup: (tokens: { sessionToken: string; hostAccessToken?: string; participantToken?: string }) => void;
+  onOpenGroup: (tokens: GroupOpenTokens) => void;
 }) {
   const [mode, setMode] = useState<"create" | "join">("create");
   const [hostName, setHostName] = useState(customerStore.profile.name);
@@ -1690,6 +1762,7 @@ function GroupOrderStartSheet({
   const [sessionToken, setSessionToken] = useState("");
   const [collectMode, setCollectMode] = useState<GroupCollectMode>("host_collects");
   const [hostQrUrl, setHostQrUrl] = useState("");
+  const [scannerOpen, setScannerOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
@@ -1741,6 +1814,12 @@ function GroupOrderStartSheet({
     }
   }
 
+  function openScannedGroup(target: GroupInviteTarget) {
+    const nextRestaurantSlug = target.restaurantSlug ?? restaurant.slug;
+    setScannerOpen(false);
+    onOpenGroup({ restaurantSlug: nextRestaurantSlug, sessionToken: target.sessionToken });
+  }
+
   return (
     <Modal transparent animationType="slide" onRequestClose={onClose} visible>
       <View style={styles.modalOverlay}>
@@ -1759,6 +1838,10 @@ function GroupOrderStartSheet({
             <SegmentButton active={mode === "create"} icon={<UsersRound color={mode === "create" ? colors.blue : colors.muted} size={16} strokeWidth={3} />} onPress={() => setMode("create")} text="Crear" />
             <SegmentButton active={mode === "join"} icon={<UsersRound color={mode === "join" ? colors.blue : colors.muted} size={16} strokeWidth={3} />} onPress={() => setMode("join")} text="Unirme" />
           </View>
+          <Pressable onPress={() => setScannerOpen(true)} style={({ pressed }) => [styles.groupScanInlineButton, pressed && styles.pressedCard]}>
+            <ScanLine color={colors.blue} size={17} strokeWidth={3} />
+            <Text style={styles.groupScanInlineText}>Escanear QR para entrar</Text>
+          </Pressable>
 
           {mode === "create" ? (
             <View style={styles.groupStartForm}>
@@ -1792,6 +1875,13 @@ function GroupOrderStartSheet({
             </View>
           )}
           {error ? <Text style={styles.submitError}>{error}</Text> : null}
+          {scannerOpen ? (
+            <GroupQrScannerModal
+              fallbackRestaurantSlug={restaurant.slug}
+              onClose={() => setScannerOpen(false)}
+              onScanned={openScannedGroup}
+            />
+          ) : null}
         </SafeAreaView>
       </View>
     </Modal>
@@ -1829,6 +1919,9 @@ function GroupOrderScreen({
   const [checkoutOpen, setCheckoutOpen] = useState(false);
   const [localParticipantToken, setLocalParticipantToken] = useState(participantToken);
   const [localHostAccessToken] = useState(hostAccessToken);
+  const [joinName, setJoinName] = useState(customerStore.profile.name);
+  const [joinPhone, setJoinPhone] = useState(customerStore.profile.phone);
+  const [inviteQrDataUrl, setInviteQrDataUrl] = useState("");
   const [loading, setLoading] = useState(Boolean(sessionToken));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -1854,6 +1947,7 @@ function GroupOrderScreen({
     .reduce((sum, item) => sum + item.subtotal, 0) ?? 0;
   const participantSubmitted = Boolean(!isHost && currentParticipant && currentParticipant.paymentStatus !== "pending");
   const canModify = Boolean(state && state.session.status === "open" && (isHost || !participantSubmitted));
+  const inviteUrl = resolvedSessionToken ? groupInviteUrl(restaurantSlug, resolvedSessionToken) : "";
 
   async function refresh(silent = false) {
     if (!resolvedSessionToken) return;
@@ -1980,15 +2074,45 @@ function GroupOrderScreen({
 
   async function shareGroup() {
     if (!resolvedSessionToken) return;
-    const url = `${config.apiBaseUrl.replace(/\/$/, "")}/r/${restaurantSlug}/grupo/${resolvedSessionToken}`;
     await Share.share({
-      message: `Unete a mi Yopido Grupal en ${restaurant?.name ?? "Yopido"}.\nCodigo: ${resolvedSessionToken}\n${url}`,
+      message: `Unete a mi Yopido Grupal en ${restaurant?.name ?? "Yopido"}.\nCodigo: ${resolvedSessionToken}\n${inviteUrl}`,
     }).catch(() => undefined);
+  }
+
+  async function joinCurrentSession() {
+    if (!resolvedSessionToken || !joinName.trim()) {
+      setError("Escribe tu nombre para unirte al pedido.");
+      return;
+    }
+    setBusy(true);
+    try {
+      const result = await joinMobileGroupOrderSession(resolvedSessionToken, {
+        displayName: joinName.trim(),
+        phone: joinPhone.trim() || undefined,
+      });
+      setLocalParticipantToken(result.participantToken);
+      setState(result);
+      setError("");
+    } catch (nextError) {
+      setError(groupOrderErrorMessage(nextError));
+    } finally {
+      setBusy(false);
+    }
   }
 
   useEffect(() => {
     void refresh();
   }, [resolvedSessionToken]);
+
+  useEffect(() => {
+    if (!inviteUrl) {
+      setInviteQrDataUrl("");
+      return;
+    }
+    QRCode.toDataURL(inviteUrl, { margin: 1, width: 280 })
+      .then(setInviteQrDataUrl)
+      .catch(() => setInviteQrDataUrl(""));
+  }, [inviteUrl]);
 
   useEffect(() => {
     if (!resolvedSessionToken || state?.session.status === "submitted" || state?.session.status === "cancelled") return;
@@ -2032,6 +2156,33 @@ function GroupOrderScreen({
                 {busy ? <ActivityIndicator color={colors.green} /> : null}
               </View>
             </View>
+
+            <View style={styles.groupInviteCard}>
+              <View style={styles.groupInviteHeader}>
+                <View style={styles.groupInviteIcon}>
+                  <QrCode color={colors.blue} size={22} strokeWidth={3} />
+                </View>
+                <View style={styles.groupEntryBody}>
+                  <Text style={styles.groupEntryTitle}>Invitar por QR</Text>
+                  <Text style={styles.groupEntryText}>Escanealo desde otra app Yopido o comparte el link.</Text>
+                </View>
+              </View>
+              {inviteQrDataUrl ? <Image source={{ uri: inviteQrDataUrl }} style={styles.groupInviteQr} /> : null}
+              <Pressable onPress={shareGroup} style={({ pressed }) => [styles.groupShareButton, pressed && styles.pressedCard]}>
+                <Share2 color={colors.blue} size={16} strokeWidth={3} />
+                <Text style={styles.groupShareButtonText}>Compartir invitacion</Text>
+              </Pressable>
+            </View>
+
+            {!currentParticipant && !isHost && state.session.status === "open" ? (
+              <View style={styles.groupPanel}>
+                <SectionTitle eyebrow="Unirme" title="Entrar al pedido" />
+                <Text style={styles.paymentHint}>No necesitas cuenta. Solo usamos tu nombre para separar lo que agregas.</Text>
+                <InputBox onChangeText={setJoinName} placeholder="Tu nombre" value={joinName} />
+                <InputBox keyboardType="phone-pad" onChangeText={setJoinPhone} placeholder="WhatsApp (opcional)" value={joinPhone} />
+                <PrimaryButton loading={busy} onPress={joinCurrentSession} text={busy ? "Entrando..." : "Entrar al pedido"} />
+              </View>
+            ) : null}
 
             {participantSubmitted && !isHost ? (
               <View style={styles.groupSubmittedCard}>
@@ -5021,6 +5172,85 @@ function BusinessHoursModal({ hours, onClose, statusText }: { hours: BusinessHou
   );
 }
 
+function GroupQrScannerModal({
+  fallbackRestaurantSlug,
+  onClose,
+  onScanned,
+}: {
+  fallbackRestaurantSlug?: string;
+  onClose: () => void;
+  onScanned: (target: GroupInviteTarget) => void;
+}) {
+  const [permission, requestPermission] = useCameraPermissions();
+  const [scanned, setScanned] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    if (permission && !permission.granted && permission.canAskAgain) {
+      void requestPermission();
+    }
+  }, [permission?.granted, permission?.canAskAgain]);
+
+  function handleBarcodeScanned(result: BarcodeScanningResult) {
+    if (scanned) return;
+    const target = parseGroupInvite(result.data);
+    if (!target) {
+      setError("Este QR no parece ser de un Yopido Grupal.");
+      setScanned(true);
+      setTimeout(() => setScanned(false), 1400);
+      return;
+    }
+
+    onScanned({
+      restaurantSlug: target.restaurantSlug ?? fallbackRestaurantSlug,
+      sessionToken: target.sessionToken,
+    });
+  }
+
+  return (
+    <Modal animationType="slide" onRequestClose={onClose} transparent visible>
+      <View style={styles.scannerOverlay}>
+        <SafeAreaView edges={["top", "bottom"]} style={styles.scannerSheet}>
+          <View style={styles.scannerHeader}>
+            <View>
+              <Text style={styles.cartSheetEyebrow}>Yopido Grupal</Text>
+              <Text style={styles.scannerTitle}>Escanear QR</Text>
+            </View>
+            <IconButton light onPress={onClose}><X color={colors.blue} size={22} strokeWidth={3} /></IconButton>
+          </View>
+          <View style={styles.scannerCameraWrap}>
+            {permission?.granted ? (
+              <CameraView
+                barcodeScannerSettings={{ barcodeTypes: ["qr"] }}
+                facing="back"
+                onBarcodeScanned={scanned ? undefined : handleBarcodeScanned}
+                style={styles.scannerCamera}
+              />
+            ) : (
+              <View style={styles.scannerPermissionBox}>
+                <ScanLine color={colors.blue} size={34} strokeWidth={2.8} />
+                <Text style={styles.scannerPermissionTitle}>Permiso de camara</Text>
+                <Text style={styles.scannerPermissionText}>Activa la camara para leer el QR de la sala grupal.</Text>
+                <PrimaryButton onPress={requestPermission} text="Permitir camara" />
+              </View>
+            )}
+            {permission?.granted ? (
+              <View pointerEvents="none" style={styles.scannerFrame}>
+                <View style={styles.scannerFrameCornerTopLeft} />
+                <View style={styles.scannerFrameCornerTopRight} />
+                <View style={styles.scannerFrameCornerBottomLeft} />
+                <View style={styles.scannerFrameCornerBottomRight} />
+              </View>
+            ) : null}
+          </View>
+          <Text style={styles.scannerHint}>Apunta al QR del Yopido Grupal. Tambien acepta links compartidos desde la web.</Text>
+          {error ? <Text style={styles.submitError}>{error}</Text> : null}
+        </SafeAreaView>
+      </View>
+    </Modal>
+  );
+}
+
 function ReviewLine({ label, value }: { label: string; value: string }) {
   return (
     <View style={styles.reviewSummaryLine}>
@@ -5063,24 +5293,7 @@ function MapPickerModal({
   const [reference, setReference] = useState("");
   const [buildingName, setBuildingName] = useState("");
   const [formError, setFormError] = useState("");
-  const [mapDebug, setMapDebug] = useState("mounting");
   const [mapTouching, setMapTouching] = useState(false);
-
-  useEffect(() => {
-    if (!__DEV__) return;
-    const timeout = setTimeout(() => {
-      setMapDebug((current) => current.includes("loaded") ? current : `${current}:waiting`);
-    }, 4500);
-    return () => clearTimeout(timeout);
-  }, []);
-
-  function noteMapDebug(status: string) {
-    if (!__DEV__) return;
-    const keyState = config.googleMapsApiKey ? `key:${config.googleMapsApiKey.length}` : "key:none";
-    const nextStatus = `${status} ${Platform.OS} ${keyState} engine:${useWebMap ? "web" : "native"}`;
-    setMapDebug(nextStatus);
-    console.info(`[YopidoMap] ${nextStatus}`);
-  }
 
   function moveMap(nextRegion: typeof region) {
     setRegion(nextRegion);
@@ -5147,9 +5360,8 @@ function MapPickerModal({
           };
         });
       }
-      if (payload.type) noteMapDebug(`web-${payload.type}`);
     } catch (error) {
-      noteMapDebug("web-message-error");
+      // Ignore non-map messages from the embedded picker.
     }
   }
 
@@ -5221,9 +5433,6 @@ function MapPickerModal({
                   javaScriptEnabled
                   mixedContentMode="always"
                   nestedScrollEnabled={false}
-                  onError={() => noteMapDebug("webview-error")}
-                  onHttpError={() => noteMapDebug("webview-http-error")}
-                  onLoad={() => noteMapDebug("webview-load")}
                   onMessage={handleWebMapMessage}
                   onTouchCancel={() => setMapTouching(false)}
                   onTouchEnd={() => setMapTouching(false)}
@@ -5245,9 +5454,6 @@ function MapPickerModal({
                   loadingIndicatorColor={colors.blue}
                   mapType="standard"
                   mapPadding={{ bottom: 12, left: 12, right: 12, top: 12 }}
-                  onLayout={() => noteMapDebug("layout")}
-                  onMapLoaded={() => noteMapDebug("loaded")}
-                  onMapReady={() => noteMapDebug("ready")}
                   onPress={(event: any) => placePin(event.nativeEvent.coordinate.latitude, event.nativeEvent.coordinate.longitude)}
                   onRegionChangeComplete={setRegion}
                   pitchEnabled={false}
@@ -5287,11 +5493,6 @@ function MapPickerModal({
               <Pressable disabled={locating} onPress={useCurrentLocation} style={({ pressed }) => [styles.mapLocateButton, pressed && styles.pressedCard]}>
                 {locating ? <ActivityIndicator color={colors.blue} size="small" /> : <Navigation color={colors.blue} size={18} strokeWidth={3} />}
               </Pressable>
-              {__DEV__ ? (
-                <View pointerEvents="none" style={styles.mapDebugBadge}>
-                  <Text numberOfLines={2} style={styles.mapDebugText}>{mapDebug}</Text>
-                </View>
-              ) : null}
             </View>
             <Text style={styles.mapPickerHint}>Arrastra el mapa o toca otro punto hasta que el pin quede sobre tu puerta.</Text>
 
@@ -5831,6 +6032,10 @@ const styles = StyleSheet.create({
   groupEntryTitle: { color: colors.ink, fontSize: 17, fontWeight: "900" },
   groupHero: { backgroundColor: colors.blue, borderBottomLeftRadius: 28, borderBottomRightRadius: 28, gap: 8, padding: 16, paddingBottom: 22 },
   groupHostActions: { gap: 9, marginTop: 12 },
+  groupInviteCard: { alignItems: "center", backgroundColor: "#FFFFFF", borderColor: colors.border, borderRadius: 22, borderWidth: 1, gap: 12, marginHorizontal: 14, marginTop: 14, padding: 14, shadowColor: colors.blue, shadowOpacity: 0.07, shadowRadius: 12 },
+  groupInviteHeader: { alignItems: "center", alignSelf: "stretch", flexDirection: "row", gap: 11 },
+  groupInviteIcon: { alignItems: "center", backgroundColor: colors.softBlue, borderRadius: 16, height: 44, justifyContent: "center", width: 44 },
+  groupInviteQr: { backgroundColor: "#FFFFFF", borderColor: colors.border, borderRadius: 18, borderWidth: 1, height: 190, width: 190 },
   groupItemBody: { flex: 1, minWidth: 0 },
   groupItemRow: { alignItems: "center", backgroundColor: "#FFFFFF", borderColor: colors.border, borderRadius: 18, borderWidth: 1, flexDirection: "row", gap: 10, marginTop: 8, padding: 11 },
   groupItemsFooter: { gap: 8, paddingHorizontal: 14, paddingTop: 4 },
@@ -5846,6 +6051,12 @@ const styles = StyleSheet.create({
   groupParticipantsList: { gap: 9 },
   groupReceiptButton: { alignItems: "center", alignSelf: "flex-start", backgroundColor: colors.green, borderRadius: 999, flexDirection: "row", gap: 6, marginTop: 9, minHeight: 36, paddingHorizontal: 11 },
   groupReceiptText: { color: colors.blue, fontSize: 12, fontWeight: "900" },
+  groupScanHeroButton: { alignItems: "center", alignSelf: "center", backgroundColor: colors.green, borderRadius: 999, flexDirection: "row", gap: 7, marginTop: 12, minHeight: 42, paddingHorizontal: 14 },
+  groupScanHeroText: { color: colors.blue, fontSize: 13, fontWeight: "900" },
+  groupScanInlineButton: { alignItems: "center", alignSelf: "stretch", backgroundColor: colors.softBlue, borderColor: colors.border, borderRadius: 16, borderWidth: 1, flexDirection: "row", gap: 8, justifyContent: "center", minHeight: 46 },
+  groupScanInlineText: { color: colors.blue, fontSize: 13, fontWeight: "900" },
+  groupShareButton: { alignItems: "center", alignSelf: "stretch", backgroundColor: colors.green, borderRadius: 999, flexDirection: "row", gap: 7, justifyContent: "center", minHeight: 42 },
+  groupShareButtonText: { color: colors.blue, fontSize: 13, fontWeight: "900" },
   groupStartForm: { gap: 12, marginTop: 14 },
   groupStartSheet: { backgroundColor: colors.surface, borderTopLeftRadius: 28, borderTopRightRadius: 28, bottom: 0, gap: 8, left: 0, padding: 18, position: "absolute", right: 0 },
   groupStatusPill: { alignSelf: "flex-start", backgroundColor: "#FFFFFF", borderRadius: 999, paddingHorizontal: 11, paddingVertical: 6 },
@@ -5972,8 +6183,6 @@ const styles = StyleSheet.create({
   mapActionTextDark: { color: "#FFFFFF", fontSize: 12, fontWeight: "900" },
   mapGridHorizontal: { backgroundColor: "rgba(18,53,91,0.09)", height: 1, left: 0, position: "absolute", right: 0, top: 72 },
   mapGridVertical: { backgroundColor: "rgba(18,53,91,0.09)", bottom: 0, left: 128, position: "absolute", top: 0, width: 1 },
-  mapDebugBadge: { backgroundColor: "rgba(8,36,65,0.88)", borderRadius: 10, bottom: 12, maxWidth: "76%", paddingHorizontal: 9, paddingVertical: 6, position: "absolute", right: 12 },
-  mapDebugText: { color: "#FFFFFF", fontSize: 10, fontWeight: "800", lineHeight: 13 },
   mapLabel: { backgroundColor: "rgba(18,53,91,0.86)", borderRadius: 15, bottom: 10, left: 10, maxWidth: "82%", paddingHorizontal: 12, paddingVertical: 8, position: "absolute" },
   mapLabelText: { color: "#FFFFFFC9", fontSize: 11, fontWeight: "800", marginTop: 1 },
   mapLabelTitle: { color: "#FFFFFF", fontSize: 13, fontWeight: "900" },
@@ -6170,6 +6379,21 @@ const styles = StyleSheet.create({
   searchSheetTitle: { color: colors.ink, fontSize: 24, fontWeight: "900", marginTop: 2 },
   searchShell: { alignItems: "center", backgroundColor: "#FFFFFF", borderRadius: 22, flexDirection: "row", gap: 10, marginHorizontal: 14, marginTop: 14, minHeight: 54, paddingLeft: 18, paddingRight: 5 },
   searchValue: { color: colors.ink },
+  scannerCamera: { height: "100%", width: "100%" },
+  scannerCameraWrap: { backgroundColor: "#081B2F", borderRadius: 24, height: 360, marginTop: 16, overflow: "hidden", position: "relative" },
+  scannerFrame: { borderColor: "rgba(255,255,255,0.22)", borderRadius: 26, borderWidth: 1, height: 220, left: "50%", marginLeft: -110, marginTop: -110, position: "absolute", top: "50%", width: 220 },
+  scannerFrameCornerBottomLeft: { borderBottomColor: colors.green, borderLeftColor: colors.green, borderBottomWidth: 5, borderLeftWidth: 5, borderRadius: 7, bottom: -1, height: 42, left: -1, position: "absolute", width: 42 },
+  scannerFrameCornerBottomRight: { borderBottomColor: colors.green, borderRightColor: colors.green, borderBottomWidth: 5, borderRightWidth: 5, borderRadius: 7, bottom: -1, height: 42, position: "absolute", right: -1, width: 42 },
+  scannerFrameCornerTopLeft: { borderLeftColor: colors.green, borderTopColor: colors.green, borderLeftWidth: 5, borderTopWidth: 5, borderRadius: 7, height: 42, left: -1, position: "absolute", top: -1, width: 42 },
+  scannerFrameCornerTopRight: { borderRightColor: colors.green, borderTopColor: colors.green, borderRightWidth: 5, borderTopWidth: 5, borderRadius: 7, height: 42, position: "absolute", right: -1, top: -1, width: 42 },
+  scannerHeader: { alignItems: "center", flexDirection: "row", justifyContent: "space-between" },
+  scannerHint: { color: colors.muted, fontSize: 12, fontWeight: "800", lineHeight: 18, marginTop: 12, textAlign: "center" },
+  scannerOverlay: { backgroundColor: "rgba(8,36,65,0.64)", flex: 1, justifyContent: "flex-end" },
+  scannerPermissionBox: { alignItems: "center", backgroundColor: colors.surface, flex: 1, gap: 10, justifyContent: "center", padding: 24 },
+  scannerPermissionText: { color: colors.muted, fontSize: 13, fontWeight: "800", lineHeight: 19, textAlign: "center" },
+  scannerPermissionTitle: { color: colors.ink, fontSize: 19, fontWeight: "900" },
+  scannerSheet: { backgroundColor: colors.surface, borderTopLeftRadius: 28, borderTopRightRadius: 28, padding: 18 },
+  scannerTitle: { color: colors.ink, fontSize: 24, fontWeight: "900", marginTop: 2 },
   sectionHeader: { alignItems: "center", flexDirection: "row", justifyContent: "space-between" },
   segmentButton: { alignItems: "center", backgroundColor: "#FFFFFF", borderColor: colors.border, borderRadius: 999, borderWidth: 1, flex: 1, flexDirection: "row", gap: 7, justifyContent: "center", minHeight: 43 },
   segmentButtonActive: { backgroundColor: colors.softBlue, borderColor: colors.green },
