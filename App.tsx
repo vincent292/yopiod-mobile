@@ -1,5 +1,6 @@
 import * as Location from "expo-location";
 import * as ImagePicker from "expo-image-picker";
+import { GlassContainer, GlassView, isGlassEffectAPIAvailable } from "expo-glass-effect";
 import { LinearGradient } from "expo-linear-gradient";
 import { StatusBar as ExpoStatusBar } from "expo-status-bar";
 import {
@@ -3820,21 +3821,39 @@ function BottomNav({ active, onNavigate }: { active: "home" | "orders" | "promos
     { key: "promos" as const, label: "Promos", icon: Flame },
     { key: "account" as const, label: "Mi Yopido", icon: UserRound },
   ];
+  const useLiquidGlass = Platform.OS === "ios" && isGlassEffectAPIAvailable();
 
-  return (
-    <View style={styles.bottomNav}>
-      {items.map((item) => {
-        const Icon = item.icon;
-        const selected = active === item.key;
-        return (
-          <Pressable key={item.key} onPress={() => onNavigate(item.key)} style={[styles.bottomNavItem, selected && styles.bottomNavItemActive]}>
-            <Icon color={selected ? colors.blue : colors.muted} size={19} strokeWidth={3} />
-            <Text style={[styles.bottomNavText, selected && styles.bottomNavTextActive]}>{item.label}</Text>
-          </Pressable>
-        );
-      })}
-    </View>
-  );
+  const content = items.map((item) => {
+    const Icon = item.icon;
+    const selected = active === item.key;
+    return (
+      <Pressable key={item.key} onPress={() => onNavigate(item.key)} style={({ pressed }) => [styles.bottomNavItem, Platform.OS === "ios" && styles.bottomNavItemIos, selected && styles.bottomNavItemActive, useLiquidGlass && selected && styles.bottomNavItemActiveGlass, pressed && styles.bottomNavItemPressed]}>
+        {useLiquidGlass && selected ? (
+          <GlassView
+            colorScheme="light"
+            glassEffectStyle={{ animate: true, animationDuration: 0.24, style: "clear" }}
+            isInteractive
+            style={styles.bottomNavActiveGlass}
+            tintColor="rgba(183,255,0,0.30)"
+          />
+        ) : null}
+        <Icon color={selected ? colors.blue : Platform.OS === "ios" ? "#31516F" : colors.muted} size={Platform.OS === "ios" ? 20 : 19} strokeWidth={3} />
+        <Text style={[styles.bottomNavText, Platform.OS === "ios" && styles.bottomNavTextIos, selected && styles.bottomNavTextActive]}>{item.label}</Text>
+      </Pressable>
+    );
+  });
+
+  if (useLiquidGlass) {
+    return (
+      <GlassContainer spacing={10} style={styles.bottomNavGlassContainer}>
+        <GlassView colorScheme="light" glassEffectStyle="regular" isInteractive style={styles.bottomNavGlass} tintColor="rgba(255,255,255,0.46)">
+          {content}
+        </GlassView>
+      </GlassContainer>
+    );
+  }
+
+  return <View style={[styles.bottomNav, Platform.OS === "ios" && styles.bottomNavIosFallback]}>{content}</View>;
 }
 
 function HomeFooter({
@@ -5950,9 +5969,17 @@ const styles = StyleSheet.create({
   bannerTopActions: { alignItems: "center", flexDirection: "row", justifyContent: "space-between" },
   bodyTop: { backgroundColor: colors.background, paddingBottom: 2, paddingHorizontal: 14, paddingTop: 22 },
   bottomNav: { alignItems: "center", backgroundColor: "#FFFFFF", borderColor: colors.border, borderRadius: 999, borderWidth: 1, bottom: 14, elevation: 10, flexDirection: "row", gap: 4, justifyContent: "center", left: 14, padding: 5, position: "absolute", right: 14, shadowColor: colors.blue, shadowOpacity: 0.16, shadowRadius: 16 },
-  bottomNavItem: { alignItems: "center", borderRadius: 999, flex: 1, gap: 2, justifyContent: "center", minHeight: 48, minWidth: 0 },
+  bottomNavActiveGlass: { borderRadius: 999, bottom: 0, left: 0, position: "absolute", right: 0, top: 0 },
+  bottomNavGlass: { alignItems: "center", borderColor: "rgba(255,255,255,0.52)", borderRadius: 999, borderWidth: 1, flexDirection: "row", gap: 5, height: 68, justifyContent: "center", overflow: "hidden", padding: 6, shadowColor: colors.blue, shadowOffset: { height: 12, width: 0 }, shadowOpacity: 0.18, shadowRadius: 24 },
+  bottomNavGlassContainer: { bottom: 22, height: 68, left: 18, position: "absolute", right: 18 },
+  bottomNavIosFallback: { backgroundColor: "rgba(255,255,255,0.86)", borderColor: "rgba(255,255,255,0.72)", bottom: 22, left: 18, padding: 6, right: 18, shadowOffset: { height: 12, width: 0 }, shadowOpacity: 0.18, shadowRadius: 24 },
+  bottomNavItem: { alignItems: "center", borderRadius: 999, flex: 1, gap: 2, justifyContent: "center", minHeight: 48, minWidth: 0, overflow: "hidden" },
   bottomNavItemActive: { backgroundColor: colors.green },
+  bottomNavItemActiveGlass: { backgroundColor: "transparent" },
+  bottomNavItemIos: { minHeight: 56 },
+  bottomNavItemPressed: { transform: [{ scale: 0.97 }] },
   bottomNavText: { color: colors.muted, fontSize: 9, fontWeight: "900" },
+  bottomNavTextIos: { color: "#31516F", fontSize: 10 },
   bottomNavTextActive: { color: colors.blue },
   brandLogo: { flexShrink: 1, height: 36, marginLeft: 3, width: 160 },
   brandRow: { alignItems: "center", flexDirection: "row", gap: 10, justifyContent: "space-between", paddingHorizontal: 14 },

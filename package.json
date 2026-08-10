@@ -1,6 +1,6 @@
 {
   "name": "yopido-mobile",
-  "version": "1.1.20",
+  "version": "1.1.21",
   "main": "index.ts",
   "dependencies": {
     "@react-native-async-storage/async-storage": "2.2.0",
@@ -10,6 +10,7 @@
     "expo-auth-session": "~57.0.6",
     "expo-camera": "~57.0.3",
     "expo-constants": "~57.0.7",
+    "expo-glass-effect": "~57.0.1",
     "expo-image-picker": "~57.0.8",
     "expo-linear-gradient": "~57.0.1",
     "expo-linking": "~57.0.4",

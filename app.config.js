@@ -3,6 +3,10 @@ module.exports = ({ config }) => {
     process.env.GOOGLE_MAPS_ANDROID_API_KEY ??
     process.env.EXPO_PUBLIC_GOOGLE_MAPS_ANDROID_API_KEY ??
     process.env.EXPO_PUBLIC_GOOGLE_MAPS_API_KEY;
+  const iosGoogleMapsApiKey =
+    process.env.GOOGLE_MAPS_IOS_API_KEY ??
+    process.env.EXPO_PUBLIC_GOOGLE_MAPS_IOS_API_KEY ??
+    process.env.EXPO_PUBLIC_GOOGLE_MAPS_API_KEY;
 
   return {
     ...config,
@@ -16,6 +20,7 @@ module.exports = ({ config }) => {
         {
           ...(plugin[1] ?? {}),
           ...(androidGoogleMapsApiKey ? { androidGoogleMapsApiKey } : {}),
+          ...(iosGoogleMapsApiKey ? { iosGoogleMapsApiKey } : {}),
         },
       ];
     }),

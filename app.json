@@ -3,13 +3,15 @@
     "name": "yopido.shop",
     "slug": "yopido-shop",
     "scheme": "yopido",
-    "version": "1.1.20",
+    "version": "1.1.21",
     "orientation": "portrait",
     "icon": "./assets/yopido-icon-dark-1024.png",
     "backgroundColor": "#12355B",
     "primaryColor": "#12355B",
     "userInterfaceStyle": "light",
     "ios": {
+      "bundleIdentifier": "shop.yopido.app",
+      "buildNumber": "1",
       "supportsTablet": true
     },
     "android": {
@@ -27,7 +29,7 @@
         "android.permission.POST_NOTIFICATIONS"
       ],
       "predictiveBackGestureEnabled": true,
-      "versionCode": 22
+      "versionCode": 23
     },
     "web": {
       "favicon": "./assets/favicon.png"
@@ -51,6 +53,12 @@
           "photosPermission": "Permite que Yopido acceda a tus fotos para subir QR y comprobantes de pago.",
           "cameraPermission": "Permite que Yopido use la camara para registrar comprobantes de pago.",
           "microphonePermission": false
+        }
+      ],
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "Permite que Yopido use tu ubicacion para mostrar restaurantes cercanos y calcular entregas."
         }
       ],
       [
