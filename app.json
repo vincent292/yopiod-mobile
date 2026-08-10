@@ -12,7 +12,10 @@
     "ios": {
       "bundleIdentifier": "shop.yopido.app",
       "buildNumber": "1",
-      "supportsTablet": true
+      "supportsTablet": true,
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false
+      }
     },
     "android": {
       "adaptiveIcon": {
