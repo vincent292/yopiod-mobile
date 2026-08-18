@@ -19,6 +19,7 @@ import {
   ClipboardCheck,
   Clock3,
   CreditCard,
+  Eye,
   Flame,
   Heart,
   Home,
@@ -2785,9 +2786,9 @@ function OrdersScreen({
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState("");
 
-  async function loadByToken(orderId: string, trackingToken: string, silent = false) {
+  async function loadByToken(orderId: string, trackingToken: string, silent = false, showRefreshIndicator = silent) {
     if (silent) {
-      setRefreshing(true);
+      if (showRefreshIndicator) setRefreshing(true);
     } else {
       setLoading(true);
       setTracking(null);
@@ -2849,9 +2850,11 @@ function OrdersScreen({
 
   useEffect(() => {
     if (!tracking || isTerminalTracking(tracking.order)) return;
+    const liveDispatchStatus = tracking.order.deliveryDispatch?.status;
+    const intervalMs = liveDispatchStatus === "active" || liveDispatchStatus === "arrived" ? 5000 : 12000;
     const interval = setInterval(() => {
-      void loadByToken(tracking.order.id, tracking.order.trackingToken, true);
-    }, 12000);
+      void loadByToken(tracking.order.id, tracking.order.trackingToken, true, false);
+    }, intervalMs);
     return () => clearInterval(interval);
   }, [tracking?.order.id, tracking?.order.trackingToken, tracking?.order.status, tracking?.order.deliveryDispatch?.status]);
 
@@ -3085,7 +3088,8 @@ function TrackingStatusCard({ onRefresh, refreshing, tracking }: { onRefresh: ()
     : null;
   const riderDistanceKm = riderLocation && deliveryLocation ? distanceInKm(riderLocation, deliveryLocation) : null;
   const riderEtaMinutes = riderDistanceKm == null ? null : Math.max(2, Math.round((riderDistanceKm / 22) * 60));
-  const hasRiderDispatch = order.orderType === "delivery" && Boolean(order.deliveryDispatch);
+  const hasDeliveryOrder = order.orderType === "delivery";
+  const hasRiderDispatch = hasDeliveryOrder && Boolean(order.deliveryDispatch);
 
   async function contactRestaurant() {
     const digits = (restaurant.whatsapp ?? "").replace(/\D/g, "");
@@ -3155,17 +3159,19 @@ function TrackingStatusCard({ onRefresh, refreshing, tracking }: { onRefresh: ()
           <Text style={styles.trackingTotalLabel}>Total</Text>
           <Text style={styles.trackingTotal}>{formatBs(Number(order.total))}</Text>
         </View>
-        {hasRiderDispatch ? (
+        {hasDeliveryOrder ? (
           <Pressable onPress={() => setRiderOpen(true)} style={({ pressed }) => [styles.riderLiveButton, pressed && styles.pressedCard]}>
             <View style={styles.riderLiveIcon}>
-              <Bike color={colors.blue} size={19} strokeWidth={3} />
+              {riderLocation ? <MapPinned color={colors.blue} size={19} strokeWidth={3} /> : <Eye color={colors.blue} size={19} strokeWidth={3} />}
             </View>
             <View style={styles.riderLiveBody}>
-              <Text style={styles.riderLiveTitle}>{riderLocation ? "Ver rider en vivo" : "Rider asignado"}</Text>
+              <Text style={styles.riderLiveTitle}>{riderLocation ? "Ver mapa en vivo" : hasRiderDispatch ? "Rider asignado" : "Esperando rider"}</Text>
               <Text numberOfLines={1} style={styles.riderLiveText}>
                 {riderLocation
                   ? `${formatRelativeUpdate(order.deliveryDispatch?.riderLocationUpdatedAt)}${riderEtaMinutes ? ` | aprox. ${riderEtaMinutes} min` : ""}`
-                  : "Esperando senal de ubicacion"}
+                  : hasRiderDispatch
+                    ? "Esperando senal de ubicacion"
+                    : "Aparecera aqui cuando acepte el pedido"}
               </Text>
             </View>
             <ArrowRight color={colors.blue} size={18} strokeWidth={3} />
@@ -3267,7 +3273,7 @@ function RiderLiveTrackingSheet({
           <View style={styles.riderSheetHeader}>
             <View>
               <Text style={styles.cartSheetEyebrow}>Delivery en vivo</Text>
-              <Text style={styles.riderSheetTitle}>{order.deliveryDispatch?.deliveryName || "Tu rider"}</Text>
+              <Text style={styles.riderSheetTitle}>{order.deliveryDispatch?.deliveryName || (order.deliveryDispatch ? "Tu rider" : "Buscando rider")}</Text>
             </View>
             <IconButton light onPress={onClose}><X color={colors.blue} size={21} strokeWidth={3} /></IconButton>
           </View>
@@ -3320,13 +3326,43 @@ function RiderLiveMap({
     NativeMapView = null;
   }
 
+  const mapRef = useRef<any>(null);
   const fallback = riderLocation ?? deliveryLocation ?? { latitude: -17.3895, longitude: -66.1568 };
   const points = [riderLocation, deliveryLocation].filter(Boolean) as Array<{ latitude: number; longitude: number }>;
+
+  useEffect(() => {
+    if (!NativeMapView || !mapRef.current || !points.length) return;
+
+    const timeout = setTimeout(() => {
+      if (points.length > 1 && typeof mapRef.current?.fitToCoordinates === "function") {
+        mapRef.current.fitToCoordinates(points, {
+          animated: true,
+          edgePadding: { bottom: 52, left: 42, right: 42, top: 52 },
+        });
+        return;
+      }
+
+      if (typeof mapRef.current?.animateToRegion === "function") {
+        mapRef.current.animateToRegion(
+          {
+            latitude: fallback.latitude,
+            latitudeDelta: 0.018,
+            longitude: fallback.longitude,
+            longitudeDelta: 0.018,
+          },
+          450,
+        );
+      }
+    }, 250);
+
+    return () => clearTimeout(timeout);
+  }, [deliveryLocation?.latitude, deliveryLocation?.longitude, riderLocation?.latitude, riderLocation?.longitude]);
 
   return (
     <View style={styles.riderMapCanvas}>
       {NativeMapView ? (
         <NativeMapView
+          ref={mapRef}
           initialRegion={{
             latitude: fallback.latitude,
             latitudeDelta: 0.035,
