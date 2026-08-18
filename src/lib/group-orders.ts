@@ -166,6 +166,7 @@ export function groupOrderErrorMessage(error: unknown) {
     "join": "No se pudo unir a la sala.",
     "minimum": "El pedido no alcanza el minimo requerido.",
     "no-open-cash": "El local aun no tiene caja abierta.",
+    "not-found": "La sala ya no existe o expiro.",
     "outside-hours": "El local esta fuera de horario.",
     "participant": "No encontramos tu participante.",
     "payment": "No se pudo actualizar el pago.",

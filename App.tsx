@@ -1,6 +1,6 @@
 import * as Location from "expo-location";
 import * as ImagePicker from "expo-image-picker";
-import { GlassContainer, GlassView, isGlassEffectAPIAvailable } from "expo-glass-effect";
+import { GlassContainer, GlassView, isGlassEffectAPIAvailable, isLiquidGlassAvailable } from "expo-glass-effect";
 import { LinearGradient } from "expo-linear-gradient";
 import { StatusBar as ExpoStatusBar } from "expo-status-bar";
 import {
@@ -83,6 +83,8 @@ import { EmptyMessage, FadeInView, IconButton, colors } from "./src/components/u
 import { GroupQrScannerModal } from "./src/features/group-orders/GroupQrScannerModal";
 import { addRecentOrder, loadCustomerStore, saveCustomerStore, upsertSavedAddress } from "./src/lib/customer-store";
 import type { CustomerStore, RecentOrder, SavedAddress, SavedFavorite } from "./src/lib/customer-store";
+import { clearSavedGroupSession, loadSavedGroupSession, saveSavedGroupSession } from "./src/lib/group-session-store";
+import type { SavedGroupSession } from "./src/lib/group-session-store";
 import { claimCustomerOrders, createCustomerAddress, customerErrorMessage, fetchCustomerAccount, mapCustomerAddressToSavedAddress, mapCustomerOrderToRecentOrder, registerCustomerAccount, setCustomerFavorite, signInCustomerAccount, updateCustomerProfile } from "./src/lib/customers";
 import { signInCustomerWithGoogle } from "./src/lib/auth";
 import { getRestaurantBySlug, listHomeDirectory, listRestaurantBusinessHours, listRestaurantCatalog } from "./src/lib/data";
@@ -100,6 +102,7 @@ import {
   getMobileGroupOrderSession,
   groupOrderErrorMessage,
   joinMobileGroupOrderSession,
+  MobileGroupOrderError,
   removeMobileGroupOrderItem,
   submitMobileGroupOrder,
   updateMobileGroupHost,
@@ -303,10 +306,17 @@ function locationFromCoordinates(latitude: number, longitude: number, city = "")
   return { city, latitude, longitude };
 }
 
+function googleMapsApiKeyForPlatform() {
+  if (Platform.OS === "ios") return config.googleMapsIosApiKey || config.googleMapsApiKey;
+  if (Platform.OS === "android") return config.googleMapsAndroidApiKey || config.googleMapsApiKey;
+  return config.googleMapsApiKey;
+}
+
 function googleStaticMapUrl(latitude: number, longitude: number) {
-  if (!config.googleMapsApiKey) return "";
+  const apiKey = googleMapsApiKeyForPlatform();
+  if (!apiKey) return "";
   const marker = `${latitude},${longitude}`;
-  return `https://maps.googleapis.com/maps/api/staticmap?center=${marker}&zoom=16&size=640x260&scale=2&maptype=roadmap&markers=color:red%7C${marker}&key=${config.googleMapsApiKey}`;
+  return `https://maps.googleapis.com/maps/api/staticmap?center=${marker}&zoom=16&size=640x260&scale=2&maptype=roadmap&markers=color:red%7C${marker}&key=${apiKey}`;
 }
 
 function clampMapZoom(zoom: number) {
@@ -475,6 +485,7 @@ function YopidoApp() {
     recentOrders: [],
     favorites: [],
   });
+  const [savedGroupSession, setSavedGroupSession] = useState<SavedGroupSession | null>(null);
 
   useEffect(() => {
     NativeStatusBar.setBarStyle("light-content");
@@ -482,6 +493,16 @@ function YopidoApp() {
       NativeStatusBar.setBackgroundColor(colors.blue);
       NativeStatusBar.setTranslucent(false);
     }
+  }, []);
+
+  useEffect(() => {
+    let mounted = true;
+    void loadSavedGroupSession().then((session) => {
+      if (mounted) setSavedGroupSession(session);
+    });
+    return () => {
+      mounted = false;
+    };
   }, []);
 
   useEffect(() => {
@@ -782,12 +803,43 @@ function YopidoApp() {
     return result;
   }
 
+  async function rememberGroupSession(session: Omit<SavedGroupSession, "updatedAt"> & { updatedAt?: string }) {
+    const nextSession = await saveSavedGroupSession(session);
+    setSavedGroupSession(nextSession);
+  }
+
+  async function forgetGroupSession(sessionToken?: string) {
+    await clearSavedGroupSession(sessionToken);
+    setSavedGroupSession((current) => (!sessionToken || current?.sessionToken === sessionToken ? null : current));
+  }
+
+  function openGroupOrder(tokens: GroupOpenTokens) {
+    if (!tokens.restaurantSlug) return;
+    setScreen({
+      name: "group",
+      hostAccessToken: tokens.hostAccessToken,
+      participantToken: tokens.participantToken,
+      restaurantSlug: tokens.restaurantSlug,
+      sessionToken: tokens.sessionToken,
+    });
+    if (tokens.sessionToken) {
+      void rememberGroupSession({
+        hostAccessToken: tokens.hostAccessToken,
+        participantToken: tokens.participantToken,
+        restaurantSlug: tokens.restaurantSlug,
+        role: tokens.hostAccessToken ? "host" : tokens.participantToken ? "participant" : "viewer",
+        sessionToken: tokens.sessionToken,
+      });
+    }
+  }
+
   return (
     <SafeAreaProvider>
       <ExpoStatusBar style="light" />
       {screen.name === "home" ? (
         <HomeScreen
           activeLocation={activeLocation}
+          activeGroupSession={savedGroupSession}
           canSaveAddress={Boolean(sessionUser?.accessToken)}
           favorites={customerStore.favorites}
           onOpenGroupInvite={(target) => {
@@ -795,8 +847,9 @@ function YopidoApp() {
               Alert.alert("QR grupal", "Este QR no incluye el local. Escanealo desde el restaurante o comparte el link completo.");
               return;
             }
-            setScreen({ name: "group", restaurantSlug: target.restaurantSlug, sessionToken: target.sessionToken });
+            openGroupOrder({ restaurantSlug: target.restaurantSlug, sessionToken: target.sessionToken });
           }}
+          onOpenSavedGroup={(session) => openGroupOrder(session)}
           onOpenRestaurant={(slug) => setScreen({ name: "restaurant", slug })}
           onSaveAddress={handleSavedAddress}
           onToggleFavorite={handleToggleFavorite}
@@ -809,7 +862,7 @@ function YopidoApp() {
           customerAccessToken={sessionUser?.accessToken}
           customerStore={customerStore}
           onBack={() => setScreen({ name: "home" })}
-          onOpenGroupOrder={(tokens) => setScreen({ name: "group", restaurantSlug: tokens?.restaurantSlug ?? screen.slug, ...tokens })}
+          onOpenGroupOrder={(tokens) => openGroupOrder({ ...tokens, restaurantSlug: tokens?.restaurantSlug ?? screen.slug })}
           onRecentOrder={handleRecentOrder}
           onSavedAddress={handleSavedAddress}
           onToggleFavorite={handleToggleFavorite}
@@ -836,6 +889,8 @@ function YopidoApp() {
           onBack={() => setScreen({ name: "restaurant", slug: screen.restaurantSlug })}
           onRecentOrder={handleRecentOrder}
           onSavedAddress={handleSavedAddress}
+          onSessionClosed={forgetGroupSession}
+          onSessionChange={rememberGroupSession}
           onTrack={(order) => setScreen({ name: "orders", ...order })}
           participantToken={screen.participantToken}
           restaurantSlug={screen.restaurantSlug}
@@ -866,9 +921,11 @@ function YopidoApp() {
 
 function HomeScreen({
   activeLocation,
+  activeGroupSession,
   canSaveAddress,
   favorites,
   onOpenGroupInvite,
+  onOpenSavedGroup,
   onOpenRestaurant,
   onSaveAddress,
   onToggleFavorite,
@@ -876,9 +933,11 @@ function HomeScreen({
   savedAddresses,
 }: {
   activeLocation?: UserLocation;
+  activeGroupSession?: SavedGroupSession | null;
   canSaveAddress: boolean;
   favorites: SavedFavorite[];
   onOpenGroupInvite: (target: GroupInviteTarget) => void;
+  onOpenSavedGroup: (session: SavedGroupSession) => void;
   onOpenRestaurant: (slug: string) => void;
   onSaveAddress: (address: Omit<SavedAddress, "id" | "updatedAt">) => Promise<SavedAddress[]>;
   onToggleFavorite: (favorite: SavedFavorite) => void | Promise<void>;
@@ -1219,6 +1278,18 @@ function HomeScreen({
                 <ScanLine color={colors.blue} size={18} strokeWidth={3} />
                 <Text style={styles.groupScanHeroText}>Escanear QR grupal</Text>
               </Pressable>
+              {activeGroupSession ? (
+                <Pressable onPress={() => onOpenSavedGroup(activeGroupSession)} style={({ pressed }) => [styles.groupResumeCard, pressed && styles.pressedCard]}>
+                  <View style={styles.groupResumeIcon}>
+                    <UsersRound color={colors.blue} size={20} strokeWidth={3} />
+                  </View>
+                  <View style={styles.groupEntryBody}>
+                    <Text numberOfLines={1} style={styles.groupResumeTitle}>Continuar pedido grupal</Text>
+                    <Text numberOfLines={1} style={styles.groupResumeText}>{activeGroupSession.restaurantName || activeGroupSession.restaurantSlug} · Codigo {activeGroupSession.sessionToken}</Text>
+                  </View>
+                  <ArrowRight color={colors.blue} size={18} strokeWidth={3} />
+                </Pressable>
+              ) : null}
 
               {featured.length ? (
                 <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.featuredRail}>
@@ -1474,11 +1545,7 @@ function RestaurantScreen({
       setHoursOpen(true);
       return;
     }
-    if (product.variants.length || product.optionGroups.length) {
-      setSelectedProduct(product);
-      return;
-    }
-    updateLineQuantity(baseCartLine(product), 1);
+    setSelectedProduct(product);
   }
 
   function quickRemoveProduct(product: ProductSummary) {
@@ -1969,6 +2036,8 @@ function GroupOrderScreen({
   onBack,
   onRecentOrder,
   onSavedAddress,
+  onSessionChange,
+  onSessionClosed,
   onTrack,
 }: {
   customerStore: CustomerStore;
@@ -1979,6 +2048,8 @@ function GroupOrderScreen({
   onBack: () => void;
   onRecentOrder: (order: RecentOrder) => void;
   onSavedAddress: (address: Omit<SavedAddress, "id" | "updatedAt">) => void;
+  onSessionChange: (session: Omit<SavedGroupSession, "updatedAt"> & { updatedAt?: string }) => void | Promise<void>;
+  onSessionClosed: (sessionToken?: string) => void | Promise<void>;
   onTrack: (order: { customerPhone?: string; orderId: string; orderNumber?: string; trackingToken: string }) => void;
 }) {
   const [state, setState] = useState<MobileGroupOrderState | null>(null);
@@ -2021,6 +2092,31 @@ function GroupOrderScreen({
   const canModify = Boolean(state && state.session.status === "open" && (isHost || !participantSubmitted));
   const inviteUrl = resolvedSessionToken ? groupInviteUrl(restaurantSlug, resolvedSessionToken) : "";
 
+  function syncSavedGroupSession(
+    nextState: MobileGroupOrderState,
+    nextRestaurant: RestaurantSummary | null,
+    participantTokenOverride = localParticipantToken,
+  ) {
+    const nextSessionToken = nextState.session.publicToken || resolvedSessionToken;
+    if (!nextSessionToken) return;
+    if (nextState.session.status === "submitted" || nextState.session.status === "cancelled" || nextState.session.status === "expired") {
+      void onSessionClosed(nextSessionToken);
+      return;
+    }
+
+    const nextHostAccessToken = nextState.isHost ? localHostAccessToken : undefined;
+    void onSessionChange({
+      expiresAt: nextState.session.expiresAt,
+      hostAccessToken: nextHostAccessToken,
+      participantToken: participantTokenOverride,
+      restaurantName: nextRestaurant?.name,
+      restaurantSlug: nextRestaurant?.slug ?? restaurantSlug,
+      role: nextHostAccessToken ? "host" : participantTokenOverride ? "participant" : "viewer",
+      sessionToken: nextSessionToken,
+      status: nextState.session.status,
+    });
+  }
+
   async function refresh(silent = false) {
     if (!resolvedSessionToken) return;
     if (!silent) setLoading(true);
@@ -2037,8 +2133,12 @@ function GroupOrderScreen({
         setCategories(catalog.categories);
         setProducts(catalog.products);
       }
+      syncSavedGroupSession(nextState, nextRestaurant ?? null);
       setError("");
     } catch (nextError) {
+      if (nextError instanceof MobileGroupOrderError && ["closed", "not-found"].includes(nextError.code)) {
+        void onSessionClosed(resolvedSessionToken);
+      }
       setError(groupOrderErrorMessage(nextError));
     } finally {
       if (!silent) setLoading(false);
@@ -2060,6 +2160,7 @@ function GroupOrderScreen({
         notes: line.notes,
       });
       setState(nextState);
+      syncSavedGroupSession(nextState, nextState.restaurant ?? restaurant);
       setError("");
     } catch (nextError) {
       setError(groupOrderErrorMessage(nextError));
@@ -2069,20 +2170,7 @@ function GroupOrderScreen({
   }
 
   async function quickAddProduct(product: ProductSummary) {
-    if (product.variants.length || product.optionGroups.length) {
-      setSelectedProduct(product);
-      return;
-    }
-    await handleAddLine({
-      cartId: product.id,
-      description: product.description,
-      imageUrl: product.imageUrl,
-      name: product.name,
-      optionIds: [],
-      price: product.price,
-      productId: product.id,
-      quantity: 0,
-    });
+    setSelectedProduct(product);
   }
 
   async function removeItem(item: MobileGroupItem) {
@@ -2095,6 +2183,7 @@ function GroupOrderScreen({
         participantToken: localParticipantToken,
       });
       setState(nextState);
+      syncSavedGroupSession(nextState, nextState.restaurant ?? restaurant);
     } catch (nextError) {
       setError(groupOrderErrorMessage(nextError));
     } finally {
@@ -2113,6 +2202,7 @@ function GroupOrderScreen({
         paymentStatus,
       });
       setState(nextState);
+      syncSavedGroupSession(nextState, nextState.restaurant ?? restaurant);
       setError("");
     } catch (nextError) {
       setError(groupOrderErrorMessage(nextError));
@@ -2125,7 +2215,9 @@ function GroupOrderScreen({
     if (!resolvedSessionToken || !localHostAccessToken) return;
     setBusy(true);
     try {
-      setState(await updateMobileGroupHost(resolvedSessionToken, { action: "status", hostAccessToken: localHostAccessToken, status: action }));
+      const nextState = await updateMobileGroupHost(resolvedSessionToken, { action: "status", hostAccessToken: localHostAccessToken, status: action });
+      setState(nextState);
+      syncSavedGroupSession(nextState, nextState.restaurant ?? restaurant);
     } catch (nextError) {
       setError(groupOrderErrorMessage(nextError));
     } finally {
@@ -2137,7 +2229,9 @@ function GroupOrderScreen({
     if (!resolvedSessionToken || !localHostAccessToken) return;
     setBusy(true);
     try {
-      setState(await updateMobileGroupHost(resolvedSessionToken, { action: "participant", hostAccessToken: localHostAccessToken, participantId, paymentStatus }));
+      const nextState = await updateMobileGroupHost(resolvedSessionToken, { action: "participant", hostAccessToken: localHostAccessToken, participantId, paymentStatus });
+      setState(nextState);
+      syncSavedGroupSession(nextState, nextState.restaurant ?? restaurant);
     } catch (nextError) {
       setError(groupOrderErrorMessage(nextError));
     } finally {
@@ -2165,6 +2259,7 @@ function GroupOrderScreen({
       });
       setLocalParticipantToken(result.participantToken);
       setState(result);
+      syncSavedGroupSession(result, result.restaurant ?? restaurant, result.participantToken);
       setError("");
     } catch (nextError) {
       setError(groupOrderErrorMessage(nextError));
@@ -2374,6 +2469,7 @@ function GroupOrderScreen({
           onClose={() => setCheckoutOpen(false)}
           onRecentOrder={onRecentOrder}
           onSavedAddress={onSavedAddress}
+          onSubmitted={() => onSessionClosed(state.session.publicToken)}
           onTrack={onTrack}
           restaurant={restaurant}
           session={state}
@@ -2475,6 +2571,7 @@ function GroupCheckoutSheet({
   onClose,
   onRecentOrder,
   onSavedAddress,
+  onSubmitted,
   onTrack,
 }: {
   customerStore: CustomerStore;
@@ -2486,6 +2583,7 @@ function GroupCheckoutSheet({
   onClose: () => void;
   onRecentOrder: (order: RecentOrder) => void;
   onSavedAddress: (address: Omit<SavedAddress, "id" | "updatedAt">) => void;
+  onSubmitted: () => void | Promise<void>;
   onTrack: (order: { customerPhone?: string; orderId: string; orderNumber?: string; trackingToken: string }) => void;
 }) {
   const firstAddress = customerStore.addresses[0];
@@ -2553,6 +2651,7 @@ function GroupCheckoutSheet({
           mapsUrl: deliveryLocation?.mapsUrl,
         });
       }
+      await onSubmitted();
       onClose();
       onTrack({ customerPhone: phone.trim(), orderId: order.orderId, orderNumber: order.orderNumber, trackingToken: order.trackingToken });
     } catch (nextError) {
@@ -2933,6 +3032,14 @@ function formatShortTime(value?: string) {
   return new Date(value).toLocaleTimeString("es-BO", { hour: "2-digit", minute: "2-digit" });
 }
 
+function formatRelativeUpdate(value?: string) {
+  if (!value) return "Sin senal reciente";
+  const minutes = Math.max(0, Math.round((Date.now() - new Date(value).getTime()) / 60000));
+  if (minutes <= 0) return "Actualizado ahora";
+  if (minutes === 1) return "Actualizado hace 1 min";
+  return `Actualizado hace ${minutes} min`;
+}
+
 function queueWindow(queue: MobileOrderQueueState) {
   if (!queue.estimatedReadyAtMin || !queue.estimatedReadyAtMax || queue.estimatedMinMinutes <= 0) return "";
   return `${formatShortTime(queue.estimatedReadyAtMin)} - ${formatShortTime(queue.estimatedReadyAtMax)}`;
@@ -2966,9 +3073,19 @@ function queueSupportText(order: MobileTrackedOrder, queue: MobileOrderQueueStat
 
 function TrackingStatusCard({ onRefresh, refreshing, tracking }: { onRefresh: () => void; refreshing: boolean; tracking: MobileTrackingResult }) {
   const [productsOpen, setProductsOpen] = useState(false);
+  const [riderOpen, setRiderOpen] = useState(false);
   const { order, queue, restaurant } = tracking;
   const { activeIndex, steps } = trackingSteps(order);
   const statusIllustration = order.status === "delivered" ? illustrationOrderSuccess : illustrationOrderStatus;
+  const riderLocation = order.deliveryDispatch?.riderLatitude != null && order.deliveryDispatch.riderLongitude != null
+    ? { latitude: order.deliveryDispatch.riderLatitude, longitude: order.deliveryDispatch.riderLongitude }
+    : null;
+  const deliveryLocation = order.deliveryLatitude != null && order.deliveryLongitude != null
+    ? { latitude: order.deliveryLatitude, longitude: order.deliveryLongitude }
+    : null;
+  const riderDistanceKm = riderLocation && deliveryLocation ? distanceInKm(riderLocation, deliveryLocation) : null;
+  const riderEtaMinutes = riderDistanceKm == null ? null : Math.max(2, Math.round((riderDistanceKm / 22) * 60));
+  const hasRiderDispatch = order.orderType === "delivery" && Boolean(order.deliveryDispatch);
 
   async function contactRestaurant() {
     const digits = (restaurant.whatsapp ?? "").replace(/\D/g, "");
@@ -3038,6 +3155,22 @@ function TrackingStatusCard({ onRefresh, refreshing, tracking }: { onRefresh: ()
           <Text style={styles.trackingTotalLabel}>Total</Text>
           <Text style={styles.trackingTotal}>{formatBs(Number(order.total))}</Text>
         </View>
+        {hasRiderDispatch ? (
+          <Pressable onPress={() => setRiderOpen(true)} style={({ pressed }) => [styles.riderLiveButton, pressed && styles.pressedCard]}>
+            <View style={styles.riderLiveIcon}>
+              <Bike color={colors.blue} size={19} strokeWidth={3} />
+            </View>
+            <View style={styles.riderLiveBody}>
+              <Text style={styles.riderLiveTitle}>{riderLocation ? "Ver rider en vivo" : "Rider asignado"}</Text>
+              <Text numberOfLines={1} style={styles.riderLiveText}>
+                {riderLocation
+                  ? `${formatRelativeUpdate(order.deliveryDispatch?.riderLocationUpdatedAt)}${riderEtaMinutes ? ` | aprox. ${riderEtaMinutes} min` : ""}`
+                  : "Esperando senal de ubicacion"}
+              </Text>
+            </View>
+            <ArrowRight color={colors.blue} size={18} strokeWidth={3} />
+          </Pressable>
+        ) : null}
         <PrimaryButton icon={<MessageCircle color={colors.blue} size={18} strokeWidth={3} />} onPress={contactRestaurant} text="Contactar restaurante" />
       </View>
 
@@ -3085,6 +3218,146 @@ function TrackingStatusCard({ onRefresh, refreshing, tracking }: { onRefresh: ()
       </View>
 
       {queue?.queueEnabled && order.status !== "cancelled" ? <VirtualQueueMobileCard order={order} queue={queue} /> : null}
+      {riderOpen ? (
+        <RiderLiveTrackingSheet
+          deliveryLocation={deliveryLocation}
+          distanceKm={riderDistanceKm}
+          etaMinutes={riderEtaMinutes}
+          onClose={() => setRiderOpen(false)}
+          order={order}
+          riderLocation={riderLocation}
+        />
+      ) : null}
+    </View>
+  );
+}
+
+function RiderLiveTrackingSheet({
+  deliveryLocation,
+  distanceKm,
+  etaMinutes,
+  onClose,
+  order,
+  riderLocation,
+}: {
+  deliveryLocation: { latitude: number; longitude: number } | null;
+  distanceKm: number | null;
+  etaMinutes: number | null;
+  onClose: () => void;
+  order: MobileTrackedOrder;
+  riderLocation: { latitude: number; longitude: number } | null;
+}) {
+  async function openRoute() {
+    const destination = deliveryLocation ?? (order.deliveryMapsUrl ? null : undefined);
+    if (riderLocation && destination) {
+      await Linking.openURL(`https://www.google.com/maps/dir/?api=1&origin=${riderLocation.latitude},${riderLocation.longitude}&destination=${destination.latitude},${destination.longitude}`).catch(() => undefined);
+      return;
+    }
+    if (order.deliveryMapsUrl) {
+      await Linking.openURL(order.deliveryMapsUrl).catch(() => undefined);
+    }
+  }
+
+  return (
+    <Modal transparent animationType="slide" onRequestClose={onClose} visible>
+      <View style={styles.modalOverlay}>
+        <Pressable style={StyleSheet.absoluteFill} onPress={onClose} />
+        <View style={styles.riderSheet}>
+          <View style={styles.mapPickerHandle} />
+          <View style={styles.riderSheetHeader}>
+            <View>
+              <Text style={styles.cartSheetEyebrow}>Delivery en vivo</Text>
+              <Text style={styles.riderSheetTitle}>{order.deliveryDispatch?.deliveryName || "Tu rider"}</Text>
+            </View>
+            <IconButton light onPress={onClose}><X color={colors.blue} size={21} strokeWidth={3} /></IconButton>
+          </View>
+
+          <RiderLiveMap deliveryLocation={deliveryLocation} riderLocation={riderLocation} />
+
+          <View style={styles.riderStatsRow}>
+            <View style={styles.riderStatCard}>
+              <Text style={styles.riderStatLabel}>Distancia</Text>
+              <Text style={styles.riderStatValue}>{distanceKm == null ? "Calculando" : formatDistance(distanceKm)}</Text>
+            </View>
+            <View style={styles.riderStatCard}>
+              <Text style={styles.riderStatLabel}>Llegada aprox.</Text>
+              <Text style={styles.riderStatValue}>{etaMinutes == null ? "En ruta" : `${etaMinutes} min`}</Text>
+            </View>
+          </View>
+
+          <View style={styles.riderSignalBox}>
+            <Navigation color={colors.blue} size={18} strokeWidth={3} />
+            <View style={styles.recentOrderBody}>
+              <Text style={styles.riderSignalTitle}>{riderLocation ? formatRelativeUpdate(order.deliveryDispatch?.riderLocationUpdatedAt) : "Sin ubicacion del rider todavia"}</Text>
+              <Text style={styles.riderSignalText}>{riderLocation ? "La posicion se actualiza automaticamente mientras el rider tenga una entrega activa." : "Cuando el rider acepte y comparta ubicacion, aparecera aqui."}</Text>
+            </View>
+          </View>
+
+          <PrimaryButton disabled={!deliveryLocation && !order.deliveryMapsUrl} icon={<MapPinned color={colors.blue} size={18} strokeWidth={3} />} onPress={openRoute} text="Abrir ruta" />
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
+function RiderLiveMap({
+  deliveryLocation,
+  riderLocation,
+}: {
+  deliveryLocation: { latitude: number; longitude: number } | null;
+  riderLocation: { latitude: number; longitude: number } | null;
+}) {
+  let NativeMapView: any = null;
+  let NativeMarker: any = null;
+  let NativePolyline: any = null;
+
+  try {
+    const nativeMaps = require("react-native-maps");
+    NativeMapView = nativeMaps.default;
+    NativeMarker = nativeMaps.Marker;
+    NativePolyline = nativeMaps.Polyline;
+  } catch {
+    NativeMapView = null;
+  }
+
+  const fallback = riderLocation ?? deliveryLocation ?? { latitude: -17.3895, longitude: -66.1568 };
+  const points = [riderLocation, deliveryLocation].filter(Boolean) as Array<{ latitude: number; longitude: number }>;
+
+  return (
+    <View style={styles.riderMapCanvas}>
+      {NativeMapView ? (
+        <NativeMapView
+          initialRegion={{
+            latitude: fallback.latitude,
+            latitudeDelta: 0.035,
+            longitude: fallback.longitude,
+            longitudeDelta: 0.035,
+          }}
+          loadingEnabled
+          moveOnMarkerPress={false}
+          pitchEnabled={false}
+          rotateEnabled={false}
+          style={StyleSheet.absoluteFill}
+          toolbarEnabled={false}
+        >
+          {riderLocation ? <NativeMarker coordinate={riderLocation} title="Rider" pinColor={colors.green} /> : null}
+          {deliveryLocation ? <NativeMarker coordinate={deliveryLocation} title="Entrega" pinColor={colors.blue} /> : null}
+          {points.length > 1 ? <NativePolyline coordinates={points} strokeColor={colors.blue} strokeWidth={4} /> : null}
+        </NativeMapView>
+      ) : (
+        <>
+          <View style={styles.mapGridVertical} />
+          <View style={styles.mapGridHorizontal} />
+          <View style={styles.mapRoadOne} />
+          <View style={styles.mapRoadTwo} />
+        </>
+      )}
+      {!riderLocation ? (
+        <View style={styles.riderMapEmpty}>
+          <Bike color={colors.blue} size={24} strokeWidth={3} />
+          <Text style={styles.riderMapEmptyText}>Esperando senal del rider</Text>
+        </View>
+      ) : null}
     </View>
   );
 }
@@ -3821,22 +4094,13 @@ function BottomNav({ active, onNavigate }: { active: "home" | "orders" | "promos
     { key: "promos" as const, label: "Promos", icon: Flame },
     { key: "account" as const, label: "Mi Yopido", icon: UserRound },
   ];
-  const useLiquidGlass = Platform.OS === "ios" && isGlassEffectAPIAvailable();
+  const useLiquidGlass = Platform.OS === "ios" && isGlassEffectAPIAvailable() && isLiquidGlassAvailable();
 
-  const content = items.map((item) => {
+  const fallbackContent = items.map((item) => {
     const Icon = item.icon;
     const selected = active === item.key;
     return (
-      <Pressable key={item.key} onPress={() => onNavigate(item.key)} style={({ pressed }) => [styles.bottomNavItem, Platform.OS === "ios" && styles.bottomNavItemIos, selected && styles.bottomNavItemActive, useLiquidGlass && selected && styles.bottomNavItemActiveGlass, pressed && styles.bottomNavItemPressed]}>
-        {useLiquidGlass && selected ? (
-          <GlassView
-            colorScheme="light"
-            glassEffectStyle={{ animate: true, animationDuration: 0.24, style: "clear" }}
-            isInteractive
-            style={styles.bottomNavActiveGlass}
-            tintColor="rgba(183,255,0,0.30)"
-          />
-        ) : null}
+      <Pressable key={item.key} onPress={() => onNavigate(item.key)} style={({ pressed }) => [styles.bottomNavItem, Platform.OS === "ios" && styles.bottomNavItemIos, selected && styles.bottomNavItemActive, pressed && styles.bottomNavItemPressed]}>
         <Icon color={selected ? colors.blue : Platform.OS === "ios" ? "#31516F" : colors.muted} size={Platform.OS === "ios" ? 20 : 19} strokeWidth={3} />
         <Text style={[styles.bottomNavText, Platform.OS === "ios" && styles.bottomNavTextIos, selected && styles.bottomNavTextActive]}>{item.label}</Text>
       </Pressable>
@@ -3845,15 +4109,38 @@ function BottomNav({ active, onNavigate }: { active: "home" | "orders" | "promos
 
   if (useLiquidGlass) {
     return (
-      <GlassContainer spacing={10} style={styles.bottomNavGlassContainer}>
-        <GlassView colorScheme="light" glassEffectStyle="regular" isInteractive style={styles.bottomNavGlass} tintColor="rgba(255,255,255,0.46)">
-          {content}
-        </GlassView>
+      <GlassContainer spacing={14} style={styles.bottomNavGlassContainer}>
+        <GlassView
+          colorScheme="light"
+          glassEffectStyle={{ animate: true, animationDuration: 0.28, style: "regular" }}
+          isInteractive
+          style={styles.bottomNavGlassBackdrop}
+          tintColor="rgba(255,255,255,0.34)"
+        />
+        {items.map((item) => {
+          const Icon = item.icon;
+          const selected = active === item.key;
+          return (
+          <GlassView
+            key={item.key}
+            colorScheme="light"
+            glassEffectStyle={{ animate: true, animationDuration: 0.3, style: selected ? "regular" : "clear" }}
+            isInteractive
+            style={[styles.bottomNavGlassItem, selected && styles.bottomNavGlassItemSelected]}
+            tintColor={selected ? "rgba(183,255,0,0.36)" : "rgba(255,255,255,0.08)"}
+          >
+            <Pressable onPress={() => onNavigate(item.key)} style={({ pressed }) => [styles.bottomNavGlassPressable, pressed && styles.bottomNavItemPressed]}>
+              <Icon color={selected ? colors.blue : "#254765"} size={21} strokeWidth={selected ? 3.2 : 2.7} />
+              <Text style={[styles.bottomNavGlassText, selected && styles.bottomNavGlassTextActive]}>{item.label}</Text>
+            </Pressable>
+          </GlassView>
+          );
+        })}
       </GlassContainer>
     );
   }
 
-  return <View style={[styles.bottomNav, Platform.OS === "ios" && styles.bottomNavIosFallback]}>{content}</View>;
+  return <View style={[styles.bottomNav, Platform.OS === "ios" && styles.bottomNavIosFallback]}>{fallbackContent}</View>;
 }
 
 function HomeFooter({
@@ -5297,6 +5584,7 @@ function MapPickerModal({
   const mapRef = useRef<any>(null);
   const webMapRef = useRef<WebView | null>(null);
   const useWebMap = Platform.OS === "android";
+  const useGoogleProvider = Platform.OS === "android" || (Platform.OS === "ios" && Boolean(config.googleMapsIosApiKey));
   const [region, setRegion] = useState({
     latitude: initialLocation?.latitude ?? fallbackLatitude,
     longitude: initialLocation?.longitude ?? fallbackLongitude,
@@ -5473,7 +5761,7 @@ function MapPickerModal({
                   onPress={(event: any) => placePin(event.nativeEvent.coordinate.latitude, event.nativeEvent.coordinate.longitude)}
                   onRegionChangeComplete={setRegion}
                   pitchEnabled={false}
-                  provider={NativeProviderGoogle}
+                  provider={useGoogleProvider ? NativeProviderGoogle : undefined}
                   ref={mapRef}
                   rotateEnabled={false}
                   scrollEnabled
@@ -5969,13 +6257,16 @@ const styles = StyleSheet.create({
   bannerTopActions: { alignItems: "center", flexDirection: "row", justifyContent: "space-between" },
   bodyTop: { backgroundColor: colors.background, paddingBottom: 2, paddingHorizontal: 14, paddingTop: 22 },
   bottomNav: { alignItems: "center", backgroundColor: "#FFFFFF", borderColor: colors.border, borderRadius: 999, borderWidth: 1, bottom: 14, elevation: 10, flexDirection: "row", gap: 4, justifyContent: "center", left: 14, padding: 5, position: "absolute", right: 14, shadowColor: colors.blue, shadowOpacity: 0.16, shadowRadius: 16 },
-  bottomNavActiveGlass: { borderRadius: 999, bottom: 0, left: 0, position: "absolute", right: 0, top: 0 },
-  bottomNavGlass: { alignItems: "center", borderColor: "rgba(255,255,255,0.52)", borderRadius: 999, borderWidth: 1, flexDirection: "row", gap: 5, height: 68, justifyContent: "center", overflow: "hidden", padding: 6, shadowColor: colors.blue, shadowOffset: { height: 12, width: 0 }, shadowOpacity: 0.18, shadowRadius: 24 },
-  bottomNavGlassContainer: { bottom: 22, height: 68, left: 18, position: "absolute", right: 18 },
+  bottomNavGlassBackdrop: { borderColor: "rgba(255,255,255,0.42)", borderRadius: 999, borderWidth: 1, bottom: 0, left: 0, overflow: "hidden", position: "absolute", right: 0, top: 0 },
+  bottomNavGlassContainer: { alignItems: "center", bottom: 20, flexDirection: "row", gap: 8, height: 74, justifyContent: "center", left: 22, padding: 7, position: "absolute", right: 22, shadowColor: "#061D34", shadowOffset: { height: 14, width: 0 }, shadowOpacity: 0.2, shadowRadius: 28 },
+  bottomNavGlassItem: { borderRadius: 999, flex: 1, height: 60, minWidth: 0, overflow: "hidden" },
+  bottomNavGlassItemSelected: { shadowColor: colors.green, shadowOffset: { height: 6, width: 0 }, shadowOpacity: 0.22, shadowRadius: 16 },
+  bottomNavGlassPressable: { alignItems: "center", flex: 1, gap: 2, justifyContent: "center", minWidth: 0 },
+  bottomNavGlassText: { color: "#254765", fontSize: 10, fontWeight: "900" },
+  bottomNavGlassTextActive: { color: colors.blue },
   bottomNavIosFallback: { backgroundColor: "rgba(255,255,255,0.86)", borderColor: "rgba(255,255,255,0.72)", bottom: 22, left: 18, padding: 6, right: 18, shadowOffset: { height: 12, width: 0 }, shadowOpacity: 0.18, shadowRadius: 24 },
   bottomNavItem: { alignItems: "center", borderRadius: 999, flex: 1, gap: 2, justifyContent: "center", minHeight: 48, minWidth: 0, overflow: "hidden" },
   bottomNavItemActive: { backgroundColor: colors.green },
-  bottomNavItemActiveGlass: { backgroundColor: "transparent" },
   bottomNavItemIos: { minHeight: 56 },
   bottomNavItemPressed: { transform: [{ scale: 0.97 }] },
   bottomNavText: { color: colors.muted, fontSize: 9, fontWeight: "900" },
@@ -6110,6 +6401,10 @@ const styles = StyleSheet.create({
   groupParticipantsList: { gap: 9 },
   groupReceiptButton: { alignItems: "center", alignSelf: "flex-start", backgroundColor: colors.green, borderRadius: 999, flexDirection: "row", gap: 6, marginTop: 9, minHeight: 36, paddingHorizontal: 11 },
   groupReceiptText: { color: colors.blue, fontSize: 12, fontWeight: "900" },
+  groupResumeCard: { alignItems: "center", alignSelf: "stretch", backgroundColor: "rgba(255,255,255,0.94)", borderColor: "rgba(255,255,255,0.58)", borderRadius: 19, borderWidth: 1, flexDirection: "row", gap: 10, marginHorizontal: 14, marginTop: 10, minHeight: 58, paddingHorizontal: 12, shadowColor: "#061D34", shadowOpacity: 0.14, shadowRadius: 12 },
+  groupResumeIcon: { alignItems: "center", backgroundColor: colors.green, borderRadius: 15, height: 40, justifyContent: "center", width: 40 },
+  groupResumeText: { color: colors.muted, fontSize: 12, fontWeight: "800", marginTop: 2 },
+  groupResumeTitle: { color: colors.ink, fontSize: 15, fontWeight: "900" },
   groupScanHeroButton: { alignItems: "center", alignSelf: "center", backgroundColor: colors.green, borderRadius: 999, flexDirection: "row", gap: 7, marginTop: 12, minHeight: 42, paddingHorizontal: 14 },
   groupScanHeroText: { color: colors.blue, fontSize: 13, fontWeight: "900" },
   groupScanInlineButton: { alignItems: "center", alignSelf: "stretch", backgroundColor: colors.softBlue, borderColor: colors.border, borderRadius: 16, borderWidth: 1, flexDirection: "row", gap: 8, justifyContent: "center", minHeight: 46 },
@@ -6368,6 +6663,24 @@ const styles = StyleSheet.create({
   recentOrderMeta: { color: colors.muted, fontSize: 12, fontWeight: "800", marginTop: 2 },
   recentOrderName: { color: colors.ink, fontSize: 14, fontWeight: "900" },
   recentOrdersBlock: { gap: 10 },
+  riderLiveBody: { flex: 1, minWidth: 0 },
+  riderLiveButton: { alignItems: "center", backgroundColor: "#F3FFE0", borderColor: colors.green, borderRadius: 17, borderWidth: 1, flexDirection: "row", gap: 10, marginTop: 12, minHeight: 60, padding: 10 },
+  riderLiveIcon: { alignItems: "center", backgroundColor: colors.green, borderRadius: 15, height: 42, justifyContent: "center", width: 42 },
+  riderLiveText: { color: colors.muted, fontSize: 12, fontWeight: "800", marginTop: 2 },
+  riderLiveTitle: { color: colors.blue, fontSize: 15, fontWeight: "900" },
+  riderMapCanvas: { backgroundColor: colors.softBlue, borderRadius: 20, height: 250, marginTop: 12, overflow: "hidden" },
+  riderMapEmpty: { alignItems: "center", alignSelf: "center", backgroundColor: "rgba(255,255,255,0.92)", borderRadius: 18, gap: 6, justifyContent: "center", marginTop: 86, minHeight: 78, paddingHorizontal: 16 },
+  riderMapEmptyText: { color: colors.blue, fontSize: 13, fontWeight: "900" },
+  riderSheet: { backgroundColor: colors.surface, borderTopLeftRadius: 28, borderTopRightRadius: 28, bottom: 0, left: 0, maxHeight: "88%", padding: 16, position: "absolute", right: 0 },
+  riderSheetHeader: { alignItems: "center", flexDirection: "row", justifyContent: "space-between" },
+  riderSheetTitle: { color: colors.ink, fontSize: 24, fontWeight: "900", marginTop: 2 },
+  riderSignalBox: { alignItems: "center", backgroundColor: "#F7F9FC", borderColor: colors.border, borderRadius: 17, borderWidth: 1, flexDirection: "row", gap: 10, marginBottom: 12, padding: 12 },
+  riderSignalText: { color: colors.muted, fontSize: 12, fontWeight: "700", lineHeight: 17, marginTop: 2 },
+  riderSignalTitle: { color: colors.ink, fontSize: 14, fontWeight: "900" },
+  riderStatCard: { backgroundColor: "#FFFFFF", borderColor: colors.border, borderRadius: 16, borderWidth: 1, flex: 1, padding: 12 },
+  riderStatLabel: { color: colors.muted, fontSize: 11, fontWeight: "900", textTransform: "uppercase" },
+  riderStatValue: { color: colors.blue, fontSize: 18, fontWeight: "900", marginTop: 4 },
+  riderStatsRow: { flexDirection: "row", gap: 8, marginVertical: 10 },
   reviewBody: { flex: 1, minWidth: 0 },
   reviewImage: { borderRadius: 14, height: 58, width: 58 },
   reviewLine: { alignItems: "center", backgroundColor: "#FFFFFF", borderColor: colors.border, borderRadius: 18, borderWidth: 1, flexDirection: "row", gap: 10, marginBottom: 8, padding: 10 },

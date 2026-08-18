@@ -146,6 +146,7 @@ export function customerErrorMessage(error: unknown) {
   if (message === "invalid-login" || message === "invalid-login-credentials" || message.toLowerCase().includes("invalid login credentials")) return "Correo o contrasena incorrectos.";
   if (message === "rate-limit") return "Demasiados intentos. Espera unos minutos y vuelve a intentar.";
   if (message === "google-auth-failed" || message === "google-session-missing") return "No pudimos iniciar sesion con Google. Intenta nuevamente.";
+  if (message.toLowerCase().includes("unsupported provider") || message.toLowerCase().includes("provider is not enabled")) return "Google no esta habilitado en Supabase Auth para esta base de datos.";
   if (message === "email-required") return "Tu cuenta no tiene correo confirmado. Ingresa nuevamente o usa otro correo.";
   if (message === "invalid-json") return "La app y la web tienen versiones distintas. Actualiza el APK o despliega la web mas reciente.";
   if (message === "customer-auth-create-failed") return "Supabase no pudo crear la cuenta. Revisa Auth en la web o intenta con otro correo.";

@@ -80,6 +80,12 @@ export type MobileDeliveryDispatch = {
   openedAt?: string;
   arrivedAt?: string;
   deliveredAt?: string;
+  riderLatitude?: number;
+  riderLongitude?: number;
+  riderLocationAccuracyMeters?: number;
+  riderLocationHeading?: number;
+  riderLocationSpeedMetersPerSecond?: number;
+  riderLocationUpdatedAt?: string;
 };
 
 export type MobileTrackedOrder = {
@@ -90,7 +96,11 @@ export type MobileTrackedOrder = {
   customerName: string;
   customerPhone: string;
   customerAddress?: string;
+  deliveryAddressDetail?: string;
+  deliveryLatitude?: number;
+  deliveryLongitude?: number;
   deliveryMapsUrl?: string;
+  deliveryDistanceKm?: number;
   orderType: MobileOrderType;
   status: MobileOrderStatus;
   paymentStatus: string;
