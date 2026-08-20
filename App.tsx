@@ -57,6 +57,7 @@ import type { ErrorInfo, ReactNode } from "react";
 import {
   ActivityIndicator,
   Alert,
+  AppState,
   BackHandler,
   FlatList,
   Image,
@@ -2285,7 +2286,9 @@ function GroupOrderScreen({
 
   useEffect(() => {
     if (!resolvedSessionToken || state?.session.status === "submitted" || state?.session.status === "cancelled") return;
-    const interval = setInterval(() => void refresh(true), state?.session.status === "open" ? 5000 : 10000);
+    const interval = setInterval(() => {
+      if (AppState.currentState === "active") void refresh(true);
+    }, state?.session.status === "open" ? 15000 : 30000);
     return () => clearInterval(interval);
   }, [resolvedSessionToken, state?.session.status, localParticipantToken, localHostAccessToken]);
 
@@ -2851,9 +2854,11 @@ function OrdersScreen({
   useEffect(() => {
     if (!tracking || isTerminalTracking(tracking.order)) return;
     const liveDispatchStatus = tracking.order.deliveryDispatch?.status;
-    const intervalMs = liveDispatchStatus === "active" || liveDispatchStatus === "arrived" ? 5000 : 12000;
+    const intervalMs = liveDispatchStatus === "active" || liveDispatchStatus === "arrived" ? 15000 : 30000;
     const interval = setInterval(() => {
-      void loadByToken(tracking.order.id, tracking.order.trackingToken, true, false);
+      if (AppState.currentState === "active") {
+        void loadByToken(tracking.order.id, tracking.order.trackingToken, true, false);
+      }
     }, intervalMs);
     return () => clearInterval(interval);
   }, [tracking?.order.id, tracking?.order.trackingToken, tracking?.order.status, tracking?.order.deliveryDispatch?.status]);
