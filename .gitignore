@@ -9,6 +9,11 @@ dist/
 web-build/
 expo-env.d.ts
 
+# mobile build artifacts
+*.apk
+*.aab
+*.ipa
+
 # local toolchains and caches
 .android-sdk/
 .android-cmdline-cache/
