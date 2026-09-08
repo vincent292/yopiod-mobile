@@ -86,6 +86,14 @@ export type MobileDeliveryDispatch = {
   riderLocationHeading?: number;
   riderLocationSpeedMetersPerSecond?: number;
   riderLocationUpdatedAt?: string;
+  riderLocation?: {
+    latitude?: number;
+    longitude?: number;
+    accuracyMeters?: number;
+    heading?: number;
+    speedMetersPerSecond?: number;
+    updatedAt?: string;
+  };
 };
 
 export type MobileTrackedOrder = {

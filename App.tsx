@@ -409,6 +409,50 @@ function leafletPickerHtml(latitude: number, longitude: number, zoom: number) {
 </html>`;
 }
 
+function leafletLiveDeliveryHtml(
+  riderLocation: { latitude: number; longitude: number } | null,
+  deliveryLocation: { latitude: number; longitude: number } | null,
+) {
+  const fallback = riderLocation ?? deliveryLocation ?? { latitude: -17.3895, longitude: -66.1568 };
+  const rider = riderLocation ? JSON.stringify([riderLocation.latitude, riderLocation.longitude]) : "null";
+  const delivery = deliveryLocation ? JSON.stringify([deliveryLocation.latitude, deliveryLocation.longitude]) : "null";
+  return `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    html, body, #map { height: 100%; margin: 0; padding: 0; width: 100%; }
+    body { background: #EEF3F8; overflow: hidden; }
+    .leaflet-control-attribution { background: rgba(255,255,255,0.72); color: #536173; font: 9px/1.2 sans-serif; }
+    .leaflet-control-zoom { display: none; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    (function () {
+      var rider = ${rider};
+      var delivery = ${delivery};
+      var map = L.map("map", { attributionControl: true, zoomControl: false }).setView([${fallback.latitude}, ${fallback.longitude}], 14);
+      L.tileLayer("https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png", {
+        attribution: "OpenStreetMap, CARTO",
+        maxZoom: 19
+      }).addTo(map);
+      if (rider) L.circleMarker(rider, { color: "#12355B", fillColor: "#B7FF00", fillOpacity: 1, radius: 10, weight: 3 }).addTo(map).bindTooltip("Rider", { permanent: true, direction: "top" });
+      if (delivery) L.circleMarker(delivery, { color: "#12355B", fillColor: "#FFFFFF", fillOpacity: 1, radius: 9, weight: 3 }).addTo(map).bindTooltip("Entrega", { permanent: true, direction: "top" });
+      if (rider && delivery) {
+        L.polyline([rider, delivery], { color: "#12355B", dashArray: "8 8", weight: 3 }).addTo(map);
+        map.fitBounds([rider, delivery], { padding: [30, 30] });
+      }
+    })();
+  </script>
+</body>
+</html>`;
+}
+
 function publicRestaurantUrl(slug: string) {
   return `https://yopido.shop/${slug}`;
 }
@@ -2854,7 +2898,7 @@ function OrdersScreen({
   useEffect(() => {
     if (!tracking || isTerminalTracking(tracking.order)) return;
     const liveDispatchStatus = tracking.order.deliveryDispatch?.status;
-    const intervalMs = liveDispatchStatus === "active" || liveDispatchStatus === "arrived" ? 15000 : 30000;
+    const intervalMs = liveDispatchStatus === "active" || liveDispatchStatus === "arrived" ? 10000 : 30000;
     const interval = setInterval(() => {
       if (AppState.currentState === "active") {
         void loadByToken(tracking.order.id, tracking.order.trackingToken, true, false);
@@ -3048,6 +3092,21 @@ function formatRelativeUpdate(value?: string) {
   return `Actualizado hace ${minutes} min`;
 }
 
+function dispatchCoordinates(order: MobileTrackedOrder) {
+  const dispatch = order.deliveryDispatch;
+  return coordinates(dispatch?.riderLocation?.latitude ?? dispatch?.riderLatitude, dispatch?.riderLocation?.longitude ?? dispatch?.riderLongitude);
+}
+
+function coordinates(latitudeValue: unknown, longitudeValue: unknown) {
+  const latitude = Number(latitudeValue);
+  const longitude = Number(longitudeValue);
+  return Number.isFinite(latitude) && Number.isFinite(longitude) ? { latitude, longitude } : null;
+}
+
+function dispatchUpdatedAt(order: MobileTrackedOrder) {
+  return order.deliveryDispatch?.riderLocation?.updatedAt ?? order.deliveryDispatch?.riderLocationUpdatedAt;
+}
+
 function queueWindow(queue: MobileOrderQueueState) {
   if (!queue.estimatedReadyAtMin || !queue.estimatedReadyAtMax || queue.estimatedMinMinutes <= 0) return "";
   return `${formatShortTime(queue.estimatedReadyAtMin)} - ${formatShortTime(queue.estimatedReadyAtMax)}`;
@@ -3085,12 +3144,9 @@ function TrackingStatusCard({ onRefresh, refreshing, tracking }: { onRefresh: ()
   const { order, queue, restaurant } = tracking;
   const { activeIndex, steps } = trackingSteps(order);
   const statusIllustration = order.status === "delivered" ? illustrationOrderSuccess : illustrationOrderStatus;
-  const riderLocation = order.deliveryDispatch?.riderLatitude != null && order.deliveryDispatch.riderLongitude != null
-    ? { latitude: order.deliveryDispatch.riderLatitude, longitude: order.deliveryDispatch.riderLongitude }
-    : null;
-  const deliveryLocation = order.deliveryLatitude != null && order.deliveryLongitude != null
-    ? { latitude: order.deliveryLatitude, longitude: order.deliveryLongitude }
-    : null;
+  const riderLocation = dispatchCoordinates(order);
+  const riderUpdatedAt = dispatchUpdatedAt(order);
+  const deliveryLocation = coordinates(order.deliveryLatitude, order.deliveryLongitude);
   const riderDistanceKm = riderLocation && deliveryLocation ? distanceInKm(riderLocation, deliveryLocation) : null;
   const riderEtaMinutes = riderDistanceKm == null ? null : Math.max(2, Math.round((riderDistanceKm / 22) * 60));
   const hasDeliveryOrder = order.orderType === "delivery";
@@ -3173,7 +3229,7 @@ function TrackingStatusCard({ onRefresh, refreshing, tracking }: { onRefresh: ()
               <Text style={styles.riderLiveTitle}>{riderLocation ? "Ver mapa en vivo" : hasRiderDispatch ? "Rider asignado" : "Esperando rider"}</Text>
               <Text numberOfLines={1} style={styles.riderLiveText}>
                 {riderLocation
-                  ? `${formatRelativeUpdate(order.deliveryDispatch?.riderLocationUpdatedAt)}${riderEtaMinutes ? ` | aprox. ${riderEtaMinutes} min` : ""}`
+                  ? `${formatRelativeUpdate(riderUpdatedAt)}${riderEtaMinutes ? ` | aprox. ${riderEtaMinutes} min` : ""}`
                   : hasRiderDispatch
                     ? "Esperando senal de ubicacion"
                     : "Aparecera aqui cuando acepte el pedido"}
@@ -3182,6 +3238,7 @@ function TrackingStatusCard({ onRefresh, refreshing, tracking }: { onRefresh: ()
             <ArrowRight color={colors.blue} size={18} strokeWidth={3} />
           </Pressable>
         ) : null}
+        {hasDeliveryOrder && (riderLocation || deliveryLocation) ? <RiderLiveMap deliveryLocation={deliveryLocation} riderLocation={riderLocation} compact /> : null}
         <PrimaryButton icon={<MessageCircle color={colors.blue} size={18} strokeWidth={3} />} onPress={contactRestaurant} text="Contactar restaurante" />
       </View>
 
@@ -3237,6 +3294,7 @@ function TrackingStatusCard({ onRefresh, refreshing, tracking }: { onRefresh: ()
           onClose={() => setRiderOpen(false)}
           order={order}
           riderLocation={riderLocation}
+          riderUpdatedAt={riderUpdatedAt}
         />
       ) : null}
     </View>
@@ -3250,6 +3308,7 @@ function RiderLiveTrackingSheet({
   onClose,
   order,
   riderLocation,
+  riderUpdatedAt,
 }: {
   deliveryLocation: { latitude: number; longitude: number } | null;
   distanceKm: number | null;
@@ -3257,6 +3316,7 @@ function RiderLiveTrackingSheet({
   onClose: () => void;
   order: MobileTrackedOrder;
   riderLocation: { latitude: number; longitude: number } | null;
+  riderUpdatedAt?: string;
 }) {
   async function openRoute() {
     const destination = deliveryLocation ?? (order.deliveryMapsUrl ? null : undefined);
@@ -3299,7 +3359,7 @@ function RiderLiveTrackingSheet({
           <View style={styles.riderSignalBox}>
             <Navigation color={colors.blue} size={18} strokeWidth={3} />
             <View style={styles.recentOrderBody}>
-              <Text style={styles.riderSignalTitle}>{riderLocation ? formatRelativeUpdate(order.deliveryDispatch?.riderLocationUpdatedAt) : "Sin ubicacion del rider todavia"}</Text>
+              <Text style={styles.riderSignalTitle}>{riderLocation ? formatRelativeUpdate(riderUpdatedAt) : "Sin ubicacion del rider todavia"}</Text>
               <Text style={styles.riderSignalText}>{riderLocation ? "La posicion se actualiza automaticamente mientras el rider tenga una entrega activa." : "Cuando el rider acepte y comparta ubicacion, aparecera aqui."}</Text>
             </View>
           </View>
@@ -3314,29 +3374,36 @@ function RiderLiveTrackingSheet({
 function RiderLiveMap({
   deliveryLocation,
   riderLocation,
+  compact = false,
 }: {
   deliveryLocation: { latitude: number; longitude: number } | null;
   riderLocation: { latitude: number; longitude: number } | null;
+  compact?: boolean;
 }) {
+  const useWebMap = Platform.OS === "android";
   let NativeMapView: any = null;
   let NativeMarker: any = null;
   let NativePolyline: any = null;
 
-  try {
-    const nativeMaps = require("react-native-maps");
-    NativeMapView = nativeMaps.default;
-    NativeMarker = nativeMaps.Marker;
-    NativePolyline = nativeMaps.Polyline;
-  } catch {
-    NativeMapView = null;
+  if (!useWebMap) {
+    try {
+      const nativeMaps = require("react-native-maps");
+      NativeMapView = nativeMaps.default;
+      NativeMarker = nativeMaps.Marker;
+      NativePolyline = nativeMaps.Polyline;
+    } catch {
+      NativeMapView = null;
+    }
   }
 
   const mapRef = useRef<any>(null);
+  const [mapReady, setMapReady] = useState(false);
   const fallback = riderLocation ?? deliveryLocation ?? { latitude: -17.3895, longitude: -66.1568 };
   const points = [riderLocation, deliveryLocation].filter(Boolean) as Array<{ latitude: number; longitude: number }>;
+  const webMapHtml = useMemo(() => leafletLiveDeliveryHtml(riderLocation, deliveryLocation), [deliveryLocation?.latitude, deliveryLocation?.longitude, riderLocation?.latitude, riderLocation?.longitude]);
 
   useEffect(() => {
-    if (!NativeMapView || !mapRef.current || !points.length) return;
+    if (useWebMap || !NativeMapView || !mapReady || !mapRef.current || !points.length) return;
 
     const timeout = setTimeout(() => {
       if (points.length > 1 && typeof mapRef.current?.fitToCoordinates === "function") {
@@ -3361,11 +3428,23 @@ function RiderLiveMap({
     }, 250);
 
     return () => clearTimeout(timeout);
-  }, [deliveryLocation?.latitude, deliveryLocation?.longitude, riderLocation?.latitude, riderLocation?.longitude]);
+  }, [deliveryLocation?.latitude, deliveryLocation?.longitude, mapReady, riderLocation?.latitude, riderLocation?.longitude, useWebMap]);
 
   return (
-    <View style={styles.riderMapCanvas}>
-      {NativeMapView ? (
+    <View style={[styles.riderMapCanvas, compact && styles.riderMapCanvasInline]}>
+      {useWebMap ? (
+        <WebView
+          domStorageEnabled
+          javaScriptEnabled
+          mixedContentMode="always"
+          originWhitelist={["*"]}
+          overScrollMode="never"
+          scrollEnabled={false}
+          setSupportMultipleWindows={false}
+          source={{ html: webMapHtml, baseUrl: "https://yopido.shop" }}
+          style={StyleSheet.absoluteFill}
+        />
+      ) : NativeMapView ? (
         <NativeMapView
           ref={mapRef}
           initialRegion={{
@@ -3375,6 +3454,7 @@ function RiderLiveMap({
             longitudeDelta: 0.035,
           }}
           loadingEnabled
+          onMapReady={() => setMapReady(true)}
           moveOnMarkerPress={false}
           pitchEnabled={false}
           rotateEnabled={false}
@@ -6710,6 +6790,7 @@ const styles = StyleSheet.create({
   riderLiveText: { color: colors.muted, fontSize: 12, fontWeight: "800", marginTop: 2 },
   riderLiveTitle: { color: colors.blue, fontSize: 15, fontWeight: "900" },
   riderMapCanvas: { backgroundColor: colors.softBlue, borderRadius: 20, height: 250, marginTop: 12, overflow: "hidden" },
+  riderMapCanvasInline: { height: 190 },
   riderMapEmpty: { alignItems: "center", alignSelf: "center", backgroundColor: "rgba(255,255,255,0.92)", borderRadius: 18, gap: 6, justifyContent: "center", marginTop: 86, minHeight: 78, paddingHorizontal: 16 },
   riderMapEmptyText: { color: colors.blue, fontSize: 13, fontWeight: "900" },
   riderSheet: { backgroundColor: colors.surface, borderTopLeftRadius: 28, borderTopRightRadius: 28, bottom: 0, left: 0, maxHeight: "88%", padding: 16, position: "absolute", right: 0 },
