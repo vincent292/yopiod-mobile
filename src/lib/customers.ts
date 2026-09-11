@@ -262,6 +262,7 @@ export function mapCustomerAddressToSavedAddress(address: MobileCustomerAddress)
     id: address.id,
     label: address.label,
     address: address.address,
+    isDefault: address.isDefault,
     latitude: address.latitude ?? undefined,
     longitude: address.longitude ?? undefined,
     mapsUrl: address.mapsUrl ?? undefined,

@@ -10,6 +10,7 @@ export type SavedAddress = {
   id: string;
   label: string;
   address: string;
+  isDefault?: boolean;
   latitude?: number;
   longitude?: number;
   mapsUrl?: string;
@@ -94,6 +95,7 @@ export async function upsertSavedAddress(userId: string | null | undefined, addr
   const nextAddress: SavedAddress = {
     ...address,
     id: `${Date.now()}`,
+    isDefault: store.addresses.length === 0,
     updatedAt: new Date().toISOString(),
   };
   const addresses = [nextAddress, ...store.addresses.filter((item) => item.address !== address.address)].slice(0, 8);

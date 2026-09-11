@@ -304,6 +304,11 @@ function nearestSavedAddress(location: UserLocation, addresses: SavedAddress[]) 
   return nearest && nearest.distanceKm <= savedAddressSnapRadiusKm ? nearest.address : null;
 }
 
+function preferredSavedAddress(addresses: SavedAddress[]) {
+  const usable = addresses.filter((address) => Number.isFinite(address.latitude) && Number.isFinite(address.longitude));
+  return usable.find((address) => address.isDefault) ?? usable[0] ?? null;
+}
+
 function locationFromCoordinates(latitude: number, longitude: number, city = ""): UserLocation {
   return { city, latitude, longitude };
 }
@@ -534,6 +539,7 @@ function YopidoApp() {
     recentOrders: [],
     favorites: [],
   });
+  const [customerStoreReady, setCustomerStoreReady] = useState(false);
   const [savedGroupSession, setSavedGroupSession] = useState<SavedGroupSession | null>(null);
 
   useEffect(() => {
@@ -641,11 +647,15 @@ function YopidoApp() {
       const user = data.session?.user ? { id: data.session.user.id, accessToken: data.session.access_token, email: data.session.user.email ?? undefined } : null;
       setSessionUser(user);
       setCustomerStore(await loadCustomerStoreForUser(user));
+      if (mounted) setCustomerStoreReady(true);
     });
     const { data } = supabase.auth.onAuthStateChange((_event, session) => {
       const user = session?.user ? { id: session.user.id, accessToken: session.access_token, email: session.user.email ?? undefined } : null;
       setSessionUser(user);
-      void loadCustomerStoreForUser(user).then(setCustomerStore);
+      void loadCustomerStoreForUser(user).then((store) => {
+        setCustomerStore(store);
+        setCustomerStoreReady(true);
+      });
     });
     return () => {
       mounted = false;
@@ -890,6 +900,7 @@ function YopidoApp() {
           activeLocation={activeLocation}
           activeGroupSession={savedGroupSession}
           canSaveAddress={Boolean(sessionUser?.accessToken)}
+          customerStoreReady={customerStoreReady}
           favorites={customerStore.favorites}
           onOpenGroupInvite={(target) => {
             if (!target.restaurantSlug) {
@@ -972,6 +983,7 @@ function HomeScreen({
   activeLocation,
   activeGroupSession,
   canSaveAddress,
+  customerStoreReady,
   favorites,
   onOpenGroupInvite,
   onOpenSavedGroup,
@@ -984,6 +996,7 @@ function HomeScreen({
   activeLocation?: UserLocation;
   activeGroupSession?: SavedGroupSession | null;
   canSaveAddress: boolean;
+  customerStoreReady: boolean;
   favorites: SavedFavorite[];
   onOpenGroupInvite: (target: GroupInviteTarget) => void;
   onOpenSavedGroup: (session: SavedGroupSession) => void;
@@ -1188,7 +1201,7 @@ function HomeScreen({
   }, [activeLocation?.latitude, activeLocation?.longitude]);
 
   useEffect(() => {
-    if (activeLocation || autoLocationAttemptRef.current) return;
+    if (!customerStoreReady || activeLocation || autoLocationAttemptRef.current) return;
     autoLocationAttemptRef.current = true;
 
     let cancelled = false;
@@ -1202,6 +1215,16 @@ function HomeScreen({
         if (cancelled) return;
         if (cachedLocation) {
           await load(cachedLocation);
+          return;
+        }
+
+        const savedAddress = preferredSavedAddress(savedAddresses);
+        if (savedAddress) {
+          const savedLocation = await locationFromSavedAddress(savedAddress);
+          if (savedLocation && !cancelled) {
+            await load(savedLocation);
+            return;
+          }
         }
 
         const permission = await Location.getForegroundPermissionsAsync();
@@ -1238,7 +1261,7 @@ function HomeScreen({
     return () => {
       cancelled = true;
     };
-  }, [activeLocation?.latitude, activeLocation?.longitude, savedAddresses.length]);
+  }, [activeLocation?.latitude, activeLocation?.longitude, customerStoreReady, savedAddresses.length]);
 
   useEffect(() => {
     if (!activeLocation || !savedAddresses.length) return;
@@ -2637,12 +2660,13 @@ function GroupCheckoutSheet({
   onSubmitted: () => void | Promise<void>;
   onTrack: (order: { customerPhone?: string; orderId: string; orderNumber?: string; trackingToken: string }) => void;
 }) {
-  const firstAddress = customerStore.addresses[0];
+  const firstAddress = preferredSavedAddress(customerStore.addresses);
   const [customerName, setCustomerName] = useState(customerStore.profile.name || session.session.hostName);
   const [phone, setPhone] = useState(customerStore.profile.phone || session.session.hostPhone);
   const [orderType, setOrderType] = useState<"delivery" | "pickup">("pickup");
   const [paymentMethod, setPaymentMethod] = useState<"cash" | "qr">("cash");
   const [address, setAddress] = useState(firstAddress?.address ?? "");
+  const [selectedAddressId, setSelectedAddressId] = useState(firstAddress?.id ?? "");
   const [deliveryLocation, setDeliveryLocation] = useState<DeliveryLocation | null>(
     firstAddress?.latitude != null && firstAddress.longitude != null
       ? { latitude: firstAddress.latitude, longitude: firstAddress.longitude, mapsUrl: firstAddress.mapsUrl ?? googleMapsUrl(firstAddress.latitude, firstAddress.longitude), label: firstAddress.label }
@@ -2730,7 +2754,7 @@ function GroupCheckoutSheet({
         total,
         trackingToken: order.trackingToken,
       });
-      if (orderType === "delivery" && address.trim()) {
+      if (orderType === "delivery" && address.trim() && !selectedAddressId) {
         onSavedAddress({
           address: address.trim(),
           city: restaurant.city,
@@ -2771,7 +2795,34 @@ function GroupCheckoutSheet({
             <InputBox keyboardType="phone-pad" onChangeText={setPhone} placeholder="WhatsApp" value={phone} />
             {orderType === "delivery" ? (
               <>
-                <InputBox multiline onChangeText={setAddress} placeholder="Direccion de entrega" value={address} />
+                {customerStore.addresses.length ? (
+                  <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.savedAddressRail}>
+                    {customerStore.addresses.map((saved) => {
+                      const selectable = saved.latitude != null && saved.longitude != null;
+                      return (
+                        <Pressable
+                          disabled={!selectable}
+                          key={saved.id}
+                          onPress={() => {
+                            setAddress(saved.address);
+                            setSelectedAddressId(saved.id);
+                            setDeliveryLocation({
+                              latitude: Number(saved.latitude),
+                              longitude: Number(saved.longitude),
+                              mapsUrl: saved.mapsUrl ?? googleMapsUrl(Number(saved.latitude), Number(saved.longitude)),
+                              label: saved.label,
+                            });
+                          }}
+                          style={({ pressed }) => [styles.savedAddressChip, selectedAddressId === saved.id && styles.savedAddressChipActive, !selectable && styles.locationOptionDisabled, pressed && styles.pressedCard]}
+                        >
+                          <MapPin color={colors.blue} size={14} strokeWidth={3} />
+                          <Text numberOfLines={1} style={[styles.savedAddressText, selectedAddressId === saved.id && styles.savedAddressTextActive]}>{saved.label}</Text>
+                        </Pressable>
+                      );
+                    })}
+                  </ScrollView>
+                ) : null}
+                <InputBox multiline onChangeText={(value) => { setAddress(value); setSelectedAddressId(""); }} placeholder="Direccion de entrega" value={address} />
                 <DeliveryMapPreview location={deliveryLocation} locating={false} onOpenMap={() => setMapPickerOpen(true)} onUseCurrent={() => setMapPickerOpen(true)} />
               </>
             ) : null}
@@ -2805,6 +2856,7 @@ function GroupCheckoutSheet({
               onClose={() => setMapPickerOpen(false)}
               onConfirm={(location) => {
                 setDeliveryLocation(location);
+                setSelectedAddressId("");
                 if (!address.trim()) setAddress(`${location.label}\n${location.mapsUrl}`);
                 setMapPickerOpen(false);
               }}
@@ -4841,7 +4893,7 @@ function ProductModal({
   const selectedVariant = product.variants.find((variant) => variant.id === variantId);
   const selectedOptionRows = product.optionGroups.flatMap((group) => group.options.filter((option) => selectedOptions[group.id]?.includes(option.id)));
   const configuredPrice = product.price + (selectedVariant?.priceDelta ?? 0) + selectedOptionRows.reduce((sum, option) => sum + option.priceDelta, 0);
-  const customizationCount = product.optionGroups.reduce((sum, group) => sum + group.options.length, 0);
+  const customizationCount = product.optionGroups.length;
   const configurationRows = product.variants.length + customizationCount;
   const sheetMaxHeight = Math.round(height * 0.94);
   const productImageHeight = Math.round(Math.min(height * 0.31, 246));
@@ -4912,7 +4964,7 @@ function ProductModal({
               <Text style={styles.sheetTitle}>{product.name}</Text>
               <Text style={styles.sheetDescription}>{product.description || "Producto disponible para tu pedido."}</Text>
 
-              {configurationRows ? <View style={styles.productModalStats}>
+              <View style={styles.productModalStats}>
                 <View style={styles.productModalStat}>
                   <Text style={styles.productModalStatValue}>{Math.max(product.variants.length, 1)}</Text>
                   <Text style={styles.productModalStatLabel}>Variantes</Text>
@@ -4925,7 +4977,7 @@ function ProductModal({
                   <Text style={styles.productModalStatValue}>{formatBs(product.price)}</Text>
                   <Text style={styles.productModalStatLabel}>Base</Text>
                 </View>
-              </View> : null}
+              </View>
 
               <View style={styles.configScrollContent}>
                 {product.variants.length ? (
@@ -5162,10 +5214,11 @@ function CartSheet({
   pushRegistration: PushRegistration | null;
 }) {
   const { height } = useWindowDimensions();
-  const firstAddress = customerStore.addresses[0];
+  const firstAddress = preferredSavedAddress(customerStore.addresses);
   const [customerName, setCustomerName] = useState(customerStore.profile.name);
   const [phone, setPhone] = useState(customerStore.profile.phone);
   const [address, setAddress] = useState(firstAddress?.address ?? "");
+  const [selectedAddressId, setSelectedAddressId] = useState(firstAddress?.id ?? "");
   const [notes, setNotes] = useState("");
   const [deliveryLocation, setDeliveryLocation] = useState<DeliveryLocation | null>(
     firstAddress?.latitude != null && firstAddress.longitude != null
@@ -5342,7 +5395,7 @@ function CartSheet({
         total: finalTotal,
         createdAt: new Date().toISOString(),
       });
-      if (orderType === "delivery" && address.trim()) {
+      if (orderType === "delivery" && address.trim() && !selectedAddressId) {
         onSavedAddress({
           label: deliveryLocation?.label ?? "Direccion de entrega",
           address: address.trim(),
@@ -5415,6 +5468,7 @@ function CartSheet({
 
   async function confirmDeliveryLocation(nextLocation: DeliveryLocation) {
     setDeliveryLocation(nextLocation);
+    setSelectedAddressId("");
     if (!address.trim()) {
       setAddress(`${nextLocation.label}\n${nextLocation.mapsUrl}`);
     } else if (!address.includes(nextLocation.mapsUrl)) {
@@ -5515,6 +5569,7 @@ function CartSheet({
                                 onPress={() => {
                                   setAddress(saved.address);
                                   if (saved.latitude != null && saved.longitude != null) {
+                                    setSelectedAddressId(saved.id);
                                     setDeliveryLocation({
                                       latitude: saved.latitude,
                                       longitude: saved.longitude,
@@ -5523,15 +5578,15 @@ function CartSheet({
                                     });
                                   }
                                 }}
-                                style={({ pressed }) => [styles.savedAddressChip, pressed && styles.pressedCard]}
+                                style={({ pressed }) => [styles.savedAddressChip, selectedAddressId === saved.id && styles.savedAddressChipActive, pressed && styles.pressedCard]}
                               >
                                 <MapPin color={colors.blue} size={14} strokeWidth={3} />
-                                <Text numberOfLines={1} style={styles.savedAddressText}>{saved.label}</Text>
+                                <Text numberOfLines={1} style={[styles.savedAddressText, selectedAddressId === saved.id && styles.savedAddressTextActive]}>{saved.label}</Text>
                               </Pressable>
                             ))}
                           </ScrollView>
                         ) : null}
-                        <InputBox multiline onChangeText={setAddress} placeholder="Direccion de entrega" value={address} />
+                        <InputBox multiline onChangeText={(value) => { setAddress(value); setSelectedAddressId(""); }} placeholder="Direccion de entrega" value={address} />
                         <DeliveryMapPreview
                           location={deliveryLocation}
                           locating={locating}
@@ -6935,8 +6990,10 @@ const styles = StyleSheet.create({
   resultsHeader: { alignItems: "flex-end", flexDirection: "row", justifyContent: "space-between", marginTop: 16 },
   safeBlue: { backgroundColor: colors.blue, flex: 1 },
   savedAddressChip: { alignItems: "center", backgroundColor: colors.softBlue, borderColor: colors.border, borderRadius: 999, borderWidth: 1, flexDirection: "row", gap: 6, maxWidth: 210, minHeight: 38, paddingHorizontal: 12 },
+  savedAddressChipActive: { backgroundColor: colors.green, borderColor: colors.blue },
   savedAddressRail: { gap: 8, paddingTop: 10 },
   savedAddressText: { color: colors.blue, fontSize: 12, fontWeight: "900" },
+  savedAddressTextActive: { color: colors.blue },
   searchBlock: { marginTop: 18 },
   searchBlockHeader: { alignItems: "center", flexDirection: "row", justifyContent: "space-between" },
   searchBlockTitle: { color: colors.ink, fontSize: 16, fontWeight: "900", marginBottom: 10 },
