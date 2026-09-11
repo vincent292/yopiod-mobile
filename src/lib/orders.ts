@@ -157,6 +157,11 @@ export type MobileTrackingResult = {
     name: string;
     slug: string;
     city: string;
+    address?: string;
+    addressReference?: string;
+    latitude?: number;
+    longitude?: number;
+    mapsUrl?: string;
     logoUrl?: string;
     businessType?: string;
     whatsapp?: string;

@@ -411,11 +411,13 @@ function leafletPickerHtml(latitude: number, longitude: number, zoom: number) {
 
 function leafletLiveDeliveryHtml(
   riderLocation: { latitude: number; longitude: number } | null,
-  deliveryLocation: { latitude: number; longitude: number } | null,
+  targetLocation: { latitude: number; longitude: number } | null,
+  targetLabel: string,
 ) {
-  const fallback = riderLocation ?? deliveryLocation ?? { latitude: -17.3895, longitude: -66.1568 };
+  const fallback = riderLocation ?? targetLocation ?? { latitude: -17.3895, longitude: -66.1568 };
   const rider = riderLocation ? JSON.stringify([riderLocation.latitude, riderLocation.longitude]) : "null";
-  const delivery = deliveryLocation ? JSON.stringify([deliveryLocation.latitude, deliveryLocation.longitude]) : "null";
+  const target = targetLocation ? JSON.stringify([targetLocation.latitude, targetLocation.longitude]) : "null";
+  const safeTargetLabel = JSON.stringify(targetLabel);
   return `<!doctype html>
 <html>
 <head>
@@ -435,17 +437,18 @@ function leafletLiveDeliveryHtml(
   <script>
     (function () {
       var rider = ${rider};
-      var delivery = ${delivery};
+      var target = ${target};
+      var targetLabel = ${safeTargetLabel};
       var map = L.map("map", { attributionControl: true, zoomControl: false }).setView([${fallback.latitude}, ${fallback.longitude}], 14);
       L.tileLayer("https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png", {
         attribution: "OpenStreetMap, CARTO",
         maxZoom: 19
       }).addTo(map);
       if (rider) L.circleMarker(rider, { color: "#12355B", fillColor: "#B7FF00", fillOpacity: 1, radius: 10, weight: 3 }).addTo(map).bindTooltip("Rider", { permanent: true, direction: "top" });
-      if (delivery) L.circleMarker(delivery, { color: "#12355B", fillColor: "#FFFFFF", fillOpacity: 1, radius: 9, weight: 3 }).addTo(map).bindTooltip("Entrega", { permanent: true, direction: "top" });
-      if (rider && delivery) {
-        L.polyline([rider, delivery], { color: "#12355B", dashArray: "8 8", weight: 3 }).addTo(map);
-        map.fitBounds([rider, delivery], { padding: [30, 30] });
+      if (target) L.circleMarker(target, { color: "#12355B", fillColor: "#FFFFFF", fillOpacity: 1, radius: 9, weight: 3 }).addTo(map).bindTooltip(targetLabel, { permanent: true, direction: "top" });
+      if (rider && target) {
+        L.polyline([rider, target], { color: "#12355B", dashArray: "8 8", weight: 3 }).addTo(map);
+        map.fitBounds([rider, target], { padding: [30, 30] });
       }
     })();
   </script>
@@ -3001,7 +3004,8 @@ function isTerminalTracking(order: MobileTrackedOrder) {
 function trackingLabel(order: MobileTrackedOrder) {
   if (order.status === "cancelled") return "Cancelado";
   if (order.orderType === "pickup" && order.status === "ready") return "Listo para recoger";
-  if (order.orderType === "delivery" && order.deliveryDispatch?.status === "arrived") return "Llego";
+  if (order.orderType === "delivery" && order.deliveryDispatch?.status === "arrived") return "En camino a tu ubicación";
+  if (order.orderType === "delivery" && order.deliveryDispatch?.status === "active") return "El rider va al punto de recogida";
   const labels: Record<MobileOrderStatus, string> = {
     accepted: "Confirmado",
     cancelled: "Cancelado",
@@ -3147,7 +3151,12 @@ function TrackingStatusCard({ onRefresh, refreshing, tracking }: { onRefresh: ()
   const riderLocation = dispatchCoordinates(order);
   const riderUpdatedAt = dispatchUpdatedAt(order);
   const deliveryLocation = coordinates(order.deliveryLatitude, order.deliveryLongitude);
-  const riderDistanceKm = riderLocation && deliveryLocation ? distanceInKm(riderLocation, deliveryLocation) : null;
+  const pickupLocation = coordinates(restaurant.latitude, restaurant.longitude);
+  const headingToCustomer = order.deliveryDispatch?.status === "arrived";
+  const targetLocation = headingToCustomer ? deliveryLocation : pickupLocation ?? deliveryLocation;
+  const targetLabel = headingToCustomer ? "Tu ubicación" : "Recogida";
+  const targetMapsUrl = headingToCustomer ? order.deliveryMapsUrl : restaurant.mapsUrl;
+  const riderDistanceKm = riderLocation && targetLocation ? distanceInKm(riderLocation, targetLocation) : null;
   const riderEtaMinutes = riderDistanceKm == null ? null : Math.max(2, Math.round((riderDistanceKm / 22) * 60));
   const hasDeliveryOrder = order.orderType === "delivery";
   const hasRiderDispatch = hasDeliveryOrder && Boolean(order.deliveryDispatch);
@@ -3238,7 +3247,7 @@ function TrackingStatusCard({ onRefresh, refreshing, tracking }: { onRefresh: ()
             <ArrowRight color={colors.blue} size={18} strokeWidth={3} />
           </Pressable>
         ) : null}
-        {hasDeliveryOrder && (riderLocation || deliveryLocation) ? <RiderLiveMap deliveryLocation={deliveryLocation} riderLocation={riderLocation} compact /> : null}
+        {hasDeliveryOrder && (riderLocation || targetLocation) ? <RiderLiveMap riderLocation={riderLocation} targetLabel={targetLabel} targetLocation={targetLocation} compact /> : null}
         <PrimaryButton icon={<MessageCircle color={colors.blue} size={18} strokeWidth={3} />} onPress={contactRestaurant} text="Contactar restaurante" />
       </View>
 
@@ -3288,13 +3297,15 @@ function TrackingStatusCard({ onRefresh, refreshing, tracking }: { onRefresh: ()
       {queue?.queueEnabled && order.status !== "cancelled" ? <VirtualQueueMobileCard order={order} queue={queue} /> : null}
       {riderOpen ? (
         <RiderLiveTrackingSheet
-          deliveryLocation={deliveryLocation}
           distanceKm={riderDistanceKm}
           etaMinutes={riderEtaMinutes}
           onClose={() => setRiderOpen(false)}
           order={order}
           riderLocation={riderLocation}
           riderUpdatedAt={riderUpdatedAt}
+          targetLabel={targetLabel}
+          targetLocation={targetLocation}
+          targetMapsUrl={targetMapsUrl}
         />
       ) : null}
     </View>
@@ -3302,30 +3313,33 @@ function TrackingStatusCard({ onRefresh, refreshing, tracking }: { onRefresh: ()
 }
 
 function RiderLiveTrackingSheet({
-  deliveryLocation,
   distanceKm,
   etaMinutes,
   onClose,
   order,
   riderLocation,
   riderUpdatedAt,
+  targetLabel,
+  targetLocation,
+  targetMapsUrl,
 }: {
-  deliveryLocation: { latitude: number; longitude: number } | null;
   distanceKm: number | null;
   etaMinutes: number | null;
   onClose: () => void;
   order: MobileTrackedOrder;
   riderLocation: { latitude: number; longitude: number } | null;
   riderUpdatedAt?: string;
+  targetLabel: string;
+  targetLocation: { latitude: number; longitude: number } | null;
+  targetMapsUrl?: string;
 }) {
   async function openRoute() {
-    const destination = deliveryLocation ?? (order.deliveryMapsUrl ? null : undefined);
-    if (riderLocation && destination) {
-      await Linking.openURL(`https://www.google.com/maps/dir/?api=1&origin=${riderLocation.latitude},${riderLocation.longitude}&destination=${destination.latitude},${destination.longitude}`).catch(() => undefined);
+    if (riderLocation && targetLocation) {
+      await Linking.openURL(`https://www.google.com/maps/dir/?api=1&origin=${riderLocation.latitude},${riderLocation.longitude}&destination=${targetLocation.latitude},${targetLocation.longitude}`).catch(() => undefined);
       return;
     }
-    if (order.deliveryMapsUrl) {
-      await Linking.openURL(order.deliveryMapsUrl).catch(() => undefined);
+    if (targetMapsUrl) {
+      await Linking.openURL(targetMapsUrl).catch(() => undefined);
     }
   }
 
@@ -3343,7 +3357,7 @@ function RiderLiveTrackingSheet({
             <IconButton light onPress={onClose}><X color={colors.blue} size={21} strokeWidth={3} /></IconButton>
           </View>
 
-          <RiderLiveMap deliveryLocation={deliveryLocation} riderLocation={riderLocation} />
+          <RiderLiveMap riderLocation={riderLocation} targetLabel={targetLabel} targetLocation={targetLocation} />
 
           <View style={styles.riderStatsRow}>
             <View style={styles.riderStatCard}>
@@ -3351,7 +3365,7 @@ function RiderLiveTrackingSheet({
               <Text style={styles.riderStatValue}>{distanceKm == null ? "Calculando" : formatDistance(distanceKm)}</Text>
             </View>
             <View style={styles.riderStatCard}>
-              <Text style={styles.riderStatLabel}>Llegada aprox.</Text>
+              <Text style={styles.riderStatLabel}>Hasta {targetLabel.toLowerCase()}</Text>
               <Text style={styles.riderStatValue}>{etaMinutes == null ? "En ruta" : `${etaMinutes} min`}</Text>
             </View>
           </View>
@@ -3364,7 +3378,7 @@ function RiderLiveTrackingSheet({
             </View>
           </View>
 
-          <PrimaryButton disabled={!deliveryLocation && !order.deliveryMapsUrl} icon={<MapPinned color={colors.blue} size={18} strokeWidth={3} />} onPress={openRoute} text="Abrir ruta" />
+          <PrimaryButton disabled={!targetLocation && !targetMapsUrl} icon={<MapPinned color={colors.blue} size={18} strokeWidth={3} />} onPress={openRoute} text={`Ver ${targetLabel.toLowerCase()}`} />
         </View>
       </View>
     </Modal>
@@ -3372,12 +3386,14 @@ function RiderLiveTrackingSheet({
 }
 
 function RiderLiveMap({
-  deliveryLocation,
   riderLocation,
+  targetLabel,
+  targetLocation,
   compact = false,
 }: {
-  deliveryLocation: { latitude: number; longitude: number } | null;
   riderLocation: { latitude: number; longitude: number } | null;
+  targetLabel: string;
+  targetLocation: { latitude: number; longitude: number } | null;
   compact?: boolean;
 }) {
   const useWebMap = Platform.OS === "android";
@@ -3398,9 +3414,9 @@ function RiderLiveMap({
 
   const mapRef = useRef<any>(null);
   const [mapReady, setMapReady] = useState(false);
-  const fallback = riderLocation ?? deliveryLocation ?? { latitude: -17.3895, longitude: -66.1568 };
-  const points = [riderLocation, deliveryLocation].filter(Boolean) as Array<{ latitude: number; longitude: number }>;
-  const webMapHtml = useMemo(() => leafletLiveDeliveryHtml(riderLocation, deliveryLocation), [deliveryLocation?.latitude, deliveryLocation?.longitude, riderLocation?.latitude, riderLocation?.longitude]);
+  const fallback = riderLocation ?? targetLocation ?? { latitude: -17.3895, longitude: -66.1568 };
+  const points = [riderLocation, targetLocation].filter(Boolean) as Array<{ latitude: number; longitude: number }>;
+  const webMapHtml = useMemo(() => leafletLiveDeliveryHtml(riderLocation, targetLocation, targetLabel), [riderLocation?.latitude, riderLocation?.longitude, targetLabel, targetLocation?.latitude, targetLocation?.longitude]);
 
   useEffect(() => {
     if (useWebMap || !NativeMapView || !mapReady || !mapRef.current || !points.length) return;
@@ -3428,7 +3444,7 @@ function RiderLiveMap({
     }, 250);
 
     return () => clearTimeout(timeout);
-  }, [deliveryLocation?.latitude, deliveryLocation?.longitude, mapReady, riderLocation?.latitude, riderLocation?.longitude, useWebMap]);
+  }, [mapReady, riderLocation?.latitude, riderLocation?.longitude, targetLocation?.latitude, targetLocation?.longitude, useWebMap]);
 
   return (
     <View style={[styles.riderMapCanvas, compact && styles.riderMapCanvasInline]}>
@@ -3462,7 +3478,7 @@ function RiderLiveMap({
           toolbarEnabled={false}
         >
           {riderLocation ? <NativeMarker coordinate={riderLocation} title="Rider" pinColor={colors.green} /> : null}
-          {deliveryLocation ? <NativeMarker coordinate={deliveryLocation} title="Entrega" pinColor={colors.blue} /> : null}
+          {targetLocation ? <NativeMarker coordinate={targetLocation} title={targetLabel} pinColor={colors.blue} /> : null}
           {points.length > 1 ? <NativePolyline coordinates={points} strokeColor={colors.blue} strokeWidth={4} /> : null}
         </NativeMapView>
       ) : (

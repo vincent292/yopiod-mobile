@@ -71,7 +71,6 @@ async function ensureOrderNotificationChannel(Notifications: NotificationsModule
     importance: Notifications.AndroidImportance.MAX,
     lightColor: "#B7FF00",
     name: "Estados de pedido",
-    sound: "default",
     vibrationPattern: [0, 250, 250, 250],
   });
 }
