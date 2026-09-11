@@ -48,9 +48,18 @@ export type MobileOrderPayload = {
   orderType: "delivery" | "pickup";
   paymentMethod: "cash" | "qr";
   push?: MobilePushSubscription;
-  deliveryFee: number;
   notes?: string;
   items: MobileOrderItem[];
+};
+
+export type MobileDeliveryQuote = {
+  distanceKm?: number;
+  deliveryFee: number;
+  minOrderAmount: number;
+  requiresQrPrepayment: boolean;
+  outOfCoverage: boolean;
+  source: "platform_rate" | "restaurant_zone" | "restaurant_base";
+  label: string;
 };
 
 export type MobileOrderResult = {
@@ -265,6 +274,15 @@ export async function createMobileOrder(payload: MobileOrderPayload, accessToken
     orderNumber: stringField(data, "orderNumber"),
     trackingToken,
   };
+}
+
+export async function getMobileDeliveryQuote(payload: {
+  restaurantId: string;
+  deliveryLatitude: number;
+  deliveryLongitude: number;
+  subtotal: number;
+}): Promise<MobileDeliveryQuote> {
+  return postMobileApi<MobileDeliveryQuote>("/api/mobile/orders/quote", payload, "delivery-quote-failed");
 }
 
 export async function trackMobileOrder(payload: {

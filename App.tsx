@@ -96,8 +96,8 @@ import { businessHoursSummary, getBusinessStatus } from "./src/lib/business-hour
 import { distanceInKm, formatDistance } from "./src/lib/distance";
 import { groupInviteUrl } from "./src/lib/group-invites";
 import type { GroupInviteTarget } from "./src/lib/group-invites";
-import { createMobileOrder, getMobileApiError, getMobileOrderStatus, trackMobileOrder } from "./src/lib/orders";
-import type { MobileOrderQueueState, MobileOrderStatus, MobileOrderType, MobileTrackedOrder, MobileTrackingResult } from "./src/lib/orders";
+import { createMobileOrder, getMobileApiError, getMobileDeliveryQuote, getMobileOrderStatus, trackMobileOrder } from "./src/lib/orders";
+import type { MobileDeliveryQuote, MobileOrderQueueState, MobileOrderStatus, MobileOrderType, MobileTrackedOrder, MobileTrackingResult } from "./src/lib/orders";
 import {
   addMobileGroupOrderItem,
   createMobileGroupOrderSession,
@@ -2652,8 +2652,46 @@ function GroupCheckoutSheet({
   const [mapPickerOpen, setMapPickerOpen] = useState(false);
   const [sending, setSending] = useState(false);
   const [error, setError] = useState("");
-  const deliveryFee = orderType === "delivery" ? 8 : 0;
+  const [deliveryQuote, setDeliveryQuote] = useState<MobileDeliveryQuote | null>(null);
+  const [deliveryQuoteLoading, setDeliveryQuoteLoading] = useState(false);
+  const deliveryFee = orderType === "delivery" ? deliveryQuote?.deliveryFee ?? 0 : 0;
   const total = subtotal + deliveryFee;
+
+  useEffect(() => {
+    if (orderType !== "delivery" || !deliveryLocation) {
+      setDeliveryQuote(null);
+      setDeliveryQuoteLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setDeliveryQuoteLoading(true);
+    const timer = setTimeout(() => {
+      void getMobileDeliveryQuote({
+        restaurantId: restaurant.id,
+        deliveryLatitude: deliveryLocation.latitude,
+        deliveryLongitude: deliveryLocation.longitude,
+        subtotal,
+      })
+        .then((quote) => {
+          if (cancelled) return;
+          setDeliveryQuote(quote);
+          setError(quote.outOfCoverage ? "La ubicación está fuera de la cobertura estándar de 14,9 km." : "");
+        })
+        .catch(() => {
+          if (!cancelled) {
+            setDeliveryQuote(null);
+            setError("No se pudo calcular la tarifa de esta ubicación.");
+          }
+        })
+        .finally(() => {
+          if (!cancelled) setDeliveryQuoteLoading(false);
+        });
+    }, 350);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [deliveryLocation?.latitude, deliveryLocation?.longitude, orderType, restaurant.id, subtotal]);
 
   async function send() {
     if (!customerName.trim()) {
@@ -2727,7 +2765,7 @@ function GroupCheckoutSheet({
           <ScrollView showsVerticalScrollIndicator={false} style={styles.cartScroll}>
             <View style={styles.choiceGrid}>
               <ChoiceCard active={orderType === "pickup"} icon={<Store color={orderType === "pickup" ? "#FFFFFF" : colors.blue} size={20} strokeWidth={3} />} label="Recojo" onPress={() => setOrderType("pickup")} text={restaurant.address || "El local confirma la direccion."} />
-              <ChoiceCard active={orderType === "delivery"} icon={<Bike color={orderType === "delivery" ? "#FFFFFF" : colors.blue} size={20} strokeWidth={3} />} label="Delivery" onPress={() => setOrderType("delivery")} text={`${formatBs(deliveryFee)} estimado`} />
+              <ChoiceCard active={orderType === "delivery"} icon={<Bike color={orderType === "delivery" ? "#FFFFFF" : colors.blue} size={20} strokeWidth={3} />} label="Delivery" onPress={() => setOrderType("delivery")} text={deliveryQuoteLoading ? "Calculando tarifa..." : deliveryQuote ? `${formatBs(deliveryFee)} · ${deliveryQuote.label}` : "Marca la ubicación para calcular"} />
             </View>
             <InputBox onChangeText={setCustomerName} placeholder="Nombre del host" value={customerName} />
             <InputBox keyboardType="phone-pad" onChangeText={setPhone} placeholder="WhatsApp" value={phone} />
@@ -2759,7 +2797,7 @@ function GroupCheckoutSheet({
               <TotalLine strong label="Total" value={formatBs(total)} />
             </View>
             {error ? <Text style={styles.submitError}>{error}</Text> : null}
-            <PrimaryButton disabled={paymentMethod === "qr" && !receiptFile} loading={sending} onPress={send} text={sending ? "Enviando..." : "Enviar a caja"} />
+            <PrimaryButton disabled={(paymentMethod === "qr" && !receiptFile) || (orderType === "delivery" && (deliveryQuoteLoading || !deliveryQuote || deliveryQuote.outOfCoverage))} loading={sending} onPress={send} text={sending ? "Enviando..." : "Enviar a caja"} />
           </ScrollView>
           {mapPickerOpen ? (
             <MapPickerModal
@@ -5149,15 +5187,57 @@ function CartSheet({
   const [locating, setLocating] = useState(false);
   const [sent, setSent] = useState(false);
   const [submitError, setSubmitError] = useState("");
+  const [deliveryQuote, setDeliveryQuote] = useState<MobileDeliveryQuote | null>(null);
+  const [deliveryQuoteLoading, setDeliveryQuoteLoading] = useState(false);
+  const [deliveryQuoteError, setDeliveryQuoteError] = useState("");
   const [createdOrder, setCreatedOrder] = useState<{ orderId: string; orderNumber: string; trackingToken: string } | null>(null);
-  const deliveryFee = orderType === "delivery" ? 8 : 0;
+  const deliveryFee = orderType === "delivery" ? deliveryQuote?.deliveryFee ?? 0 : 0;
   const finalTotal = total + deliveryFee;
   const itemCount = items.reduce((sum, item) => sum + item.quantity, 0);
   const detailsReady = Boolean(customerName.trim() && phone.trim());
   const deliveryReady = orderType === "pickup" || Boolean(address.trim() && deliveryLocation);
-  const submitDisabled = orderingDisabled || sending || locating || !items.length || !detailsReady || !deliveryReady;
+  const submitDisabled = orderingDisabled || sending || locating || !items.length || !detailsReady || !deliveryReady || (orderType === "delivery" && (deliveryQuoteLoading || !deliveryQuote || deliveryQuote.outOfCoverage));
   const cartMaxHeight = Math.round(height * 0.94);
   const primaryText = step === 3 ? (sending ? "Enviando pedido..." : "Confirmar pedido") : "Guardar y continuar";
+
+  useEffect(() => {
+    if (orderType !== "delivery" || !deliveryLocation) {
+      setDeliveryQuote(null);
+      setDeliveryQuoteLoading(false);
+      setDeliveryQuoteError("");
+      return;
+    }
+
+    let cancelled = false;
+    setDeliveryQuoteLoading(true);
+    setDeliveryQuoteError("");
+    const timer = setTimeout(() => {
+      void getMobileDeliveryQuote({
+        restaurantId: restaurant.id,
+        deliveryLatitude: deliveryLocation.latitude,
+        deliveryLongitude: deliveryLocation.longitude,
+        subtotal: total,
+      })
+        .then((quote) => {
+          if (cancelled) return;
+          setDeliveryQuote(quote);
+          setDeliveryQuoteError(quote.outOfCoverage ? "La ubicación está fuera de la cobertura estándar de 14,9 km." : "");
+        })
+        .catch((error) => {
+          if (cancelled) return;
+          setDeliveryQuote(null);
+          setDeliveryQuoteError(getMobileApiError(error)?.code === "api-network-failed" ? "No se pudo calcular el envío. Revisa tu conexión." : "No se pudo calcular la tarifa de esta ubicación.");
+        })
+        .finally(() => {
+          if (!cancelled) setDeliveryQuoteLoading(false);
+        });
+    }, 350);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [deliveryLocation?.latitude, deliveryLocation?.longitude, orderType, restaurant.id, total]);
 
   function goNext() {
     if (orderingDisabled) {
@@ -5239,7 +5319,6 @@ function CartSheet({
               },
             }
           : {}),
-        deliveryFee,
         notes: notes.trim() || undefined,
         items: items.map((item) => ({
           productId: item.productId,
@@ -5404,7 +5483,7 @@ function CartSheet({
                         icon={<Bike color={orderType === "delivery" ? "#FFFFFF" : colors.blue} size={20} strokeWidth={3} />}
                         label="Envio a domicilio"
                         onPress={() => setOrderType("delivery")}
-                        text={deliveryFee ? `${formatBs(deliveryFee)} de envio` : "Delivery disponible"}
+                        text={deliveryQuoteLoading ? "Calculando tarifa..." : deliveryQuote ? `${formatBs(deliveryFee)} · ${deliveryQuote.label}` : "Marca la ubicación para calcular"}
                       />
                     </View>
 
@@ -5518,6 +5597,7 @@ function CartSheet({
                   <TotalLine strong label="Total a pagar" value={formatBs(finalTotal)} />
                 </View>
 
+                {deliveryQuoteError ? <Text style={styles.submitError}>{deliveryQuoteError}</Text> : null}
                 {submitError ? <Text style={styles.submitError}>{submitError}</Text> : null}
                 <View style={styles.orderFooterActions}>
                   {step > 0 ? (
@@ -6013,6 +6093,8 @@ function orderErrorMessage(error: unknown) {
   if (message === "invalid-public-order-total") return "El total cambio. Vacia el carrito, vuelve a agregar los productos e intenta otra vez.";
   if (message === "product-configuration") return "Revisa las opciones del producto antes de enviar.";
   if (message === "outside-hours") return "El negocio esta fuera de horario. Puedes ver el menu, pero no enviar pedidos hasta que abra.";
+  if (message === "delivery-out-of-coverage") return "La ubicacion esta fuera de la cobertura de delivery configurada.";
+  if (message === "minimum-order") return "El subtotal no alcanza el pedido minimo para esta zona.";
   if (message === "no-open-cash") return "El restaurante necesita abrir caja para recibir pedidos.";
   if (message === "prepayment-required") return "Este pedido requiere pago QR y comprobante antes de enviarse.";
   if (message === "invalid-order-response") return "La web respondio sin datos de seguimiento. Actualiza la web desplegada y vuelve a intentar.";
