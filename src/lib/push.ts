@@ -364,3 +364,17 @@ export function listenForOrderNotificationOpen(
     },
   };
 }
+
+// Read without requesting permission, e.g. after returning from system settings.
+export async function getOrderNotificationPermission(): Promise<"granted" | "denied" | "unavailable"> {
+  if (Platform.OS === "web") return "unavailable";
+  const notifications = await loadNotifications();
+  if (!notifications) return "unavailable";
+  const permission = await notifications.getPermissionsAsync();
+  if (!permission.granted) return "denied";
+  if (Platform.OS === "android") {
+    const channel = await notifications.getNotificationChannelAsync(orderChannelId);
+    if (channel?.importance === notifications.AndroidImportance.NONE) return "denied";
+  }
+  return "granted";
+}

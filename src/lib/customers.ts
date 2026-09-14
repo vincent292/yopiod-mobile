@@ -133,6 +133,10 @@ async function customerApi<T>(path: string, init: RequestInit, fallbackCode = "c
 
 export function customerErrorMessage(error: unknown) {
   const message = error instanceof CustomerApiError ? error.code : error instanceof Error ? error.message : "customer-api-failed";
+  if (message === "account-has-active-orders") return "Tienes pedidos pendientes. Termínalos o cancélalos antes de eliminar tu cuenta.";
+  if (message === "account-has-business-role") return "Esta cuenta también administra un local o trabaja como rider. Debes desvincular ese acceso antes de eliminarla.";
+  if (message === "account-delete-failed") return "No se pudo eliminar la cuenta. Tus datos siguen guardados; vuelve a intentarlo.";
+  if (message === "address-not-found") return "Esta dirección ya no existe. Vuelve a abrir Mis direcciones para actualizar la lista.";
   if (message === "api-network-failed") return "No pudimos conectar con la web. Si el APK apunta a una web local o a un puerto, recompila usando una URL accesible desde el celular.";
   if (message === "api-timeout") return "La web tardo demasiado en responder. Intenta nuevamente en unos segundos.";
   if (message === "phone-already-exists") return "Ese telefono ya esta registrado en otra cuenta.";
@@ -238,6 +242,27 @@ export async function createCustomerAddress(
     body: JSON.stringify(input),
     headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
     method: "POST",
+  });
+}
+
+export async function updateCustomerAddress(accessToken: string, id: string, address?: Parameters<typeof createCustomerAddress>[1]) {
+  return customerApi<{ addresses: MobileCustomerAddress[] }>("/api/mobile/customers/addresses", {
+    method: "PATCH", headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+    body: JSON.stringify(address ? { action: "update", id, address } : { action: "default", id }),
+  });
+}
+
+export async function deleteCustomerAddress(accessToken: string, id: string) {
+  return customerApi<{ addresses: MobileCustomerAddress[] }>("/api/mobile/customers/addresses", {
+    method: "DELETE", headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ id }),
+  });
+}
+
+export async function deleteCustomerAccount(accessToken: string) {
+  return customerApi<{ ok: true }>("/api/mobile/customers/profile", {
+    method: "DELETE", headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ confirmation: "ELIMINAR" }),
   });
 }
 

@@ -2,7 +2,6 @@ import * as Location from "expo-location";
 import * as ImagePicker from "expo-image-picker";
 import { GlassContainer, GlassView, isGlassEffectAPIAvailable, isLiquidGlassAvailable } from "expo-glass-effect";
 import { LinearGradient } from "expo-linear-gradient";
-import { StatusBar as ExpoStatusBar } from "expo-status-bar";
 import {
   Activity,
   ArrowRight,
@@ -39,6 +38,9 @@ import {
   ReceiptText,
   ScanLine,
   Search,
+  Settings,
+  Trash2,
+  Pencil,
   Send,
   Share2,
   Shirt,
@@ -77,22 +79,25 @@ import {
   useWindowDimensions,
   View,
 } from "react-native";
+import { NavigationContainer, StackActions, useNavigationContainerRef, useIsFocused } from "@react-navigation/native";
+import { createNativeStackNavigator } from "@react-navigation/native-stack";
 import QRCode from "qrcode";
-import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
+import { SafeAreaProvider, SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { WebView } from "react-native-webview";
 import type { WebViewMessageEvent } from "react-native-webview";
 import { EmptyMessage, FadeInView, IconButton, colors } from "./src/components/ui";
 import { GroupQrScannerModal } from "./src/features/group-orders/GroupQrScannerModal";
-import { addRecentOrder, loadCustomerStore, saveCustomerStore, upsertSavedAddress } from "./src/lib/customer-store";
+import { addRecentOrder, clearCustomerStore, loadCustomerStore, saveCustomerStore, upsertSavedAddress } from "./src/lib/customer-store";
 import type { CustomerStore, RecentOrder, SavedAddress, SavedFavorite } from "./src/lib/customer-store";
 import { clearSavedGroupSession, loadSavedGroupSession, saveSavedGroupSession } from "./src/lib/group-session-store";
 import type { SavedGroupSession } from "./src/lib/group-session-store";
-import { claimCustomerOrders, createCustomerAddress, customerErrorMessage, fetchCustomerAccount, mapCustomerAddressToSavedAddress, mapCustomerOrderToRecentOrder, registerCustomerAccount, setCustomerFavorite, signInCustomerAccount, updateCustomerProfile } from "./src/lib/customers";
+import { claimCustomerOrders, createCustomerAddress, updateCustomerAddress, deleteCustomerAddress, deleteCustomerAccount, customerErrorMessage, fetchCustomerAccount, mapCustomerAddressToSavedAddress, mapCustomerOrderToRecentOrder, registerCustomerAccount, setCustomerFavorite, signInCustomerAccount, updateCustomerProfile } from "./src/lib/customers";
 import { signInCustomerWithGoogle } from "./src/lib/auth";
 import { getRestaurantBySlug, listHomeDirectory, listRestaurantBusinessHours, listRestaurantCatalog } from "./src/lib/data";
 import { config } from "./src/lib/config";
 import { clearCache, readCache, readCacheEnvelope, writeCache } from "./src/lib/cache";
 import { businessHoursSummary, getBusinessStatus } from "./src/lib/business-hours";
+import { coordinates, formatRelativeUpdate, trackingLabel } from "./src/lib/tracking-presentation";
 import { distanceInKm, formatDistance } from "./src/lib/distance";
 import { groupInviteUrl } from "./src/lib/group-invites";
 import type { GroupInviteTarget } from "./src/lib/group-invites";
@@ -111,18 +116,20 @@ import {
   updateMobileGroupParticipantPayment,
 } from "./src/lib/group-orders";
 import type { GroupCollectMode, GroupPaymentStatus, MobileGroupItem, MobileGroupOrderState, MobileGroupParticipant, MobileUploadFile } from "./src/lib/group-orders";
-import { listenForOrderNotificationOpen, requestOrderNotificationRegistration, scheduleOrderNotificationTest } from "./src/lib/push";
-import type { LocalNotificationResult, PushRegistration, PushRegistrationResult } from "./src/lib/push";
+import { getOrderNotificationPermission, listenForOrderNotificationOpen, requestOrderNotificationRegistration } from "./src/lib/push";
+import type { PushRegistration, PushRegistrationResult } from "./src/lib/push";
 import { supabase } from "./src/lib/supabase";
 import type { BusinessHour, CategorySummary, HomeDirectory, PopularProductSummary, ProductSummary, RestaurantSummary, UserLocation } from "./src/types/domain";
 
 type Screen =
   | { name: "home" }
-  | { name: "restaurant"; slug: string }
+  | { name: "restaurant"; slug: string; productId?: string }
   | { name: "group"; restaurantSlug: string; sessionToken?: string; hostAccessToken?: string; participantToken?: string }
   | { name: "orders"; orderId?: string; trackingToken?: string; orderNumber?: string; customerPhone?: string }
   | { name: "promos" }
-  | { name: "account" };
+  | { name: "account"; panel?: AccountPanelView };
+type AppStackParams = { Page: Screen };
+const AppStack = createNativeStackNavigator<AppStackParams>();
 type CartLine = {
   cartId: string;
   productId: string;
@@ -135,10 +142,11 @@ type CartLine = {
   quantity: number;
   notes?: string;
 };
+type DeliveryPoint = { latitude: number; longitude: number } | null;
 type DeliveryLocation = { latitude: number; longitude: number; mapsUrl: string; label: string };
 type AddressDetails = { label: string; apartment: string; reference: string; buildingName: string };
 type SessionUser = { id: string; email?: string; accessToken?: string };
-type AccountPanelView = "home" | "addresses" | "orders" | "favorites" | "help";
+type AccountPanelView = "home" | "addresses" | "orders" | "favorites" | "help" | "settings";
 type OrderHistoryFilter = "all" | "delivery" | "pickup";
 type FavoriteFilter = "all" | "restaurant" | "product";
 type NotificationStatus = "checking" | "disabled" | "error" | "ready" | "unknown";
@@ -370,8 +378,8 @@ function leafletPickerHtml(latitude: number, longitude: number, zoom: number) {
       });
 
       var tilesLoaded = false;
-      var tiles = L.tileLayer("https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png", {
-        attribution: "OpenStreetMap, CARTO",
+      var tiles = L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors' ,
         maxZoom: 19
       }).addTo(map);
 
@@ -414,51 +422,39 @@ function leafletPickerHtml(latitude: number, longitude: number, zoom: number) {
 </html>`;
 }
 
-function leafletLiveDeliveryHtml(
-  riderLocation: { latitude: number; longitude: number } | null,
-  targetLocation: { latitude: number; longitude: number } | null,
-  targetLabel: string,
-) {
-  const fallback = riderLocation ?? targetLocation ?? { latitude: -17.3895, longitude: -66.1568 };
-  const rider = riderLocation ? JSON.stringify([riderLocation.latitude, riderLocation.longitude]) : "null";
-  const target = targetLocation ? JSON.stringify([targetLocation.latitude, targetLocation.longitude]) : "null";
-  const safeTargetLabel = JSON.stringify(targetLabel);
-  return `<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+function leafletLiveDeliveryHtml() {
+  return `<!doctype html><html><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-  <style>
-    html, body, #map { height: 100%; margin: 0; padding: 0; width: 100%; }
-    body { background: #EEF3F8; overflow: hidden; }
-    .leaflet-control-attribution { background: rgba(255,255,255,0.72); color: #536173; font: 9px/1.2 sans-serif; }
-    .leaflet-control-zoom { display: none; }
-  </style>
-</head>
-<body>
-  <div id="map"></div>
-  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-  <script>
-    (function () {
-      var rider = ${rider};
-      var target = ${target};
-      var targetLabel = ${safeTargetLabel};
-      var map = L.map("map", { attributionControl: true, zoomControl: false }).setView([${fallback.latitude}, ${fallback.longitude}], 14);
-      L.tileLayer("https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png", {
-        attribution: "OpenStreetMap, CARTO",
-        maxZoom: 19
-      }).addTo(map);
-      if (rider) L.circleMarker(rider, { color: "#12355B", fillColor: "#B7FF00", fillOpacity: 1, radius: 10, weight: 3 }).addTo(map).bindTooltip("Rider", { permanent: true, direction: "top" });
-      if (target) L.circleMarker(target, { color: "#12355B", fillColor: "#FFFFFF", fillOpacity: 1, radius: 9, weight: 3 }).addTo(map).bindTooltip(targetLabel, { permanent: true, direction: "top" });
-      if (rider && target) {
-        L.polyline([rider, target], { color: "#12355B", dashArray: "8 8", weight: 3 }).addTo(map);
-        map.fitBounds([rider, target], { padding: [30, 30] });
-      }
-    })();
-  </script>
-</body>
-</html>`;
+  <style>html,body,#map{height:100%;margin:0;width:100%}body{background:#EEF3F8}.leaflet-control-attribution{font:9px sans-serif}.yopido-pin{border:3px solid #12355B;border-radius:50%;background:white;width:28px;height:28px;display:flex;align-items:center;justify-content:center;color:#12355B;font:700 16px sans-serif}.yopido-rider{background:#B7FF00}</style></head>
+  <body><div id="map"></div><script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script><script>
+  (function(){
+    var map=L.map('map',{zoomControl:false}).setView([-17.3895,-66.1568],13),markers={},fitted=false,hadRider=false;
+    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{attribution:'&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors' ,maxZoom:19}).addTo(map);
+    var points=[];
+    window.fitYopidoDelivery=function(){if(points.length)map.fitBounds(points,{padding:[42,42],maxZoom:16});};
+    window.updateYopidoDelivery=function(data){
+      points=[];
+      ['pickup','delivery','rider'].forEach(function(key){
+        var point=data[key];
+        if(!point){if(markers[key]){map.removeLayer(markers[key]);delete markers[key];}return;}
+        var coords=[point.latitude,point.longitude];points.push(coords);
+        if(markers[key])markers[key].setLatLng(coords);
+        else {
+          var label=key==='pickup'?'Recogida':key==='delivery'?'Entrega':'Rider';
+          var symbol=key==='pickup'?'R':key==='delivery'?'E':'●';
+          markers[key]=L.marker(coords,{icon:L.divIcon({className:'',html:'<div class="yopido-pin '+(key==='rider'?'yopido-rider':'')+'">'+symbol+'</div>',iconSize:[34,34],iconAnchor:[17,17]})}).addTo(map).bindTooltip(label,{direction:'top'});
+        }
+      });
+      if((!fitted||(!hadRider&&data.rider))&&points.length){window.fitYopidoDelivery();fitted=true;}hadRider=!!data.rider;
+    };
+    window.addEventListener('message',function(event){
+      if(event.source!==window.parent)return;
+      if(event.data&&event.data.type==='yopido-map-update')window.updateYopidoDelivery(event.data.points);
+      if(event.data&&event.data.type==='yopido-map-center')window.fitYopidoDelivery();
+    });
+    if(window.ReactNativeWebView)window.ReactNativeWebView.postMessage('map-ready');
+    else window.parent.postMessage({type:'yopido-map-ready'},'*');
+  })();</script></body></html>`;
 }
 
 function publicRestaurantUrl(slug: string) {
@@ -526,7 +522,29 @@ class AppErrorBoundary extends Component<{ children: ReactNode }, { message: str
 }
 
 function YopidoApp() {
-  const [screen, setScreen] = useState<Screen>({ name: "home" });
+  const [screen, setCurrentScreen] = useState<Screen>({ name: "home" });
+  const navigation = useNavigationContainerRef<AppStackParams>();
+  const pendingScreen = useRef<Screen | null>(null);
+  function setScreen(next: Screen) {
+    if (!navigation.isReady()) { pendingScreen.current = next; return; }
+    navigation.dispatch(StackActions.push("Page", next));
+  }
+  function goBack() {
+    if (navigation.canGoBack()) navigation.goBack();
+  }
+  function switchTab(name: "home" | "promos" | "account") {
+    const routes = navigation.getRootState()?.routes ?? [];
+    const index = routes.findIndex((route) => {
+      const target = route.params as Screen;
+      return target.name === name && (target.name !== "account" || !target.panel || target.panel === "home");
+    });
+    if (index >= 0) {
+      const count = routes.length - 1 - index;
+      if (count) navigation.dispatch(StackActions.pop(count));
+    } else setScreen({ name });
+  }
+  const accountLoadVersion = useRef(0);
+  const deletedAccountIds = useRef(new Set<string>());
   const [sessionUser, setSessionUser] = useState<SessionUser | null>(null);
   const [activeLocation, setActiveLocation] = useState<UserLocation | undefined>();
   const [pushRegistration, setPushRegistration] = useState<PushRegistration | null>(null);
@@ -592,6 +610,21 @@ function YopidoApp() {
   }, []);
 
   useEffect(() => {
+    const listener = AppState.addEventListener("change", (state) => {
+      if (state !== "active") return;
+      void getOrderNotificationPermission().then((permission) => {
+        if (permission === "denied") {
+          setPushRegistration(null); setNotificationStatus("disabled");
+          setNotificationMessage("Notificaciones desactivadas en los ajustes del teléfono.");
+        } else if (permission === "granted") {
+          void requestOrderNotificationRegistration().then(applyNotificationRegistrationResult).catch(() => undefined);
+        }
+      }).catch(() => undefined);
+    });
+    return () => listener.remove();
+  }, []);
+
+  useEffect(() => {
     const subscription = listenForOrderNotificationOpen((order) => {
       if (order.orderId && order.trackingToken) {
         setScreen({ name: "orders", ...order });
@@ -629,38 +662,43 @@ function YopidoApp() {
   }, [customerStore.recentOrders, pushRegistration]);
 
   useEffect(() => {
+    // Native navigation consumes Back when a previous screen exists. At the root,
+    // keep the user in the app instead of accidentally closing it.
     const subscription = BackHandler.addEventListener("hardwareBackPress", () => {
-      if (screen.name !== "home") {
-        setScreen({ name: "home" });
-        return true;
-      }
+      if (navigation.isReady() && navigation.canGoBack()) navigation.goBack();
       return true;
     });
-
     return () => subscription.remove();
-  }, [screen]);
+  }, [navigation]);
 
   useEffect(() => {
     let mounted = true;
-    supabase.auth.getSession().then(async ({ data }) => {
-      if (!mounted) return;
-      const user = data.session?.user ? { id: data.session.user.id, accessToken: data.session.access_token, email: data.session.user.email ?? undefined } : null;
+    async function applySession(user: SessionUser | null) {
+      const version = ++accountLoadVersion.current;
       setSessionUser(user);
-      setCustomerStore(await loadCustomerStoreForUser(user));
-      if (mounted) setCustomerStoreReady(true);
-    });
-    const { data } = supabase.auth.onAuthStateChange((_event, session) => {
-      const user = session?.user ? { id: session.user.id, accessToken: session.access_token, email: session.user.email ?? undefined } : null;
-      setSessionUser(user);
-      void loadCustomerStoreForUser(user).then((store) => {
+      const store = await loadCustomerStoreForUser(user);
+      if (mounted && version === accountLoadVersion.current) {
         setCustomerStore(store);
         setCustomerStoreReady(true);
-      });
+      }
+    }
+    void supabase.auth.getSession().then(({ data }) => {
+      if (!mounted) return;
+      const user = data.session?.user ? { id: data.session.user.id, accessToken: data.session.access_token, email: data.session.user.email ?? undefined } : null;
+      void applySession(user);
     });
-    return () => {
-      mounted = false;
-      data.subscription.unsubscribe();
-    };
+    const { data } = supabase.auth.onAuthStateChange((event, session) => {
+      const user = session?.user ? { id: session.user.id, accessToken: session.access_token, email: session.user.email ?? undefined } : null;
+      if (event === "SIGNED_OUT") {
+        setCustomerStore({ profile: { name: "", phone: "", documentNumber: "" }, addresses: [], recentOrders: [], favorites: [] });
+        setActiveLocation(undefined);
+        void clearCache("home-location");
+        if (navigation.isReady()) navigation.resetRoot({ index: 1, routes: [{ name: "Page", params: { name: "home" } }, { name: "Page", params: { name: "account" } }] });
+      }
+      // Defer API work outside Supabase's auth callback lock.
+      void Promise.resolve().then(() => { if (mounted) void applySession(user); });
+    });
+    return () => { mounted = false; data.subscription.unsubscribe(); };
   }, []);
 
   useEffect(() => {
@@ -736,6 +774,7 @@ function YopidoApp() {
         ),
         favorites: favoriteSyncComplete ? remoteFavorites : mergeFavoriteLists(remoteFavorites, pendingFavorites),
       };
+      if (deletedAccountIds.current.has(user.id)) return { profile: { name: "", phone: "", documentNumber: "" }, addresses: [], recentOrders: [], favorites: [] };
       await saveCustomerStore(user.id, nextStore);
       return nextStore;
     } catch {
@@ -744,6 +783,7 @@ function YopidoApp() {
         recentOrders: mergeRecentOrderLists(localStore.recentOrders, deviceStore.recentOrders),
         favorites: mergeFavoriteLists(localStore.favorites, deviceStore.favorites),
       };
+      if (deletedAccountIds.current.has(user.id)) return { profile: { name: "", phone: "", documentNumber: "" }, addresses: [], recentOrders: [], favorites: [] };
       await saveCustomerStore(user.id, fallbackStore);
       return fallbackStore;
     }
@@ -842,26 +882,6 @@ function YopidoApp() {
     return result;
   }
 
-  async function handleTestNotification(): Promise<LocalNotificationResult> {
-    const result = await scheduleOrderNotificationTest();
-    setNotificationMessage(result.message);
-    if (!result.ok) {
-      console.log("Order notification local test failed", {
-        error: result.error,
-        reason: result.reason,
-      });
-      if (result.reason === "permission-blocked") {
-        setNotificationStatus("disabled");
-        showNotificationSettingsAlert(result.message);
-      } else if (result.reason === "permission-denied") {
-        setNotificationStatus("disabled");
-      } else {
-        setNotificationStatus("error");
-      }
-    }
-    return result;
-  }
-
   async function rememberGroupSession(session: Omit<SavedGroupSession, "updatedAt"> & { updatedAt?: string }) {
     const nextSession = await saveSavedGroupSession(session);
     setSavedGroupSession(nextSession);
@@ -870,6 +890,20 @@ function YopidoApp() {
   async function forgetGroupSession(sessionToken?: string) {
     await clearSavedGroupSession(sessionToken);
     setSavedGroupSession((current) => (!sessionToken || current?.sessionToken === sessionToken ? null : current));
+  }
+
+  async function handleAccountDeleted() {
+    const userId = sessionUser?.id;
+    if (userId) deletedAccountIds.current.add(userId);
+    ++accountLoadVersion.current;
+    await clearCustomerStore(userId);
+    await clearCustomerStore();
+    await clearCache("home-location");
+    await clearSavedGroupSession();
+    setActiveLocation(undefined);
+    setSavedGroupSession(null);
+    await supabase.auth.signOut({ scope: "local" });
+    navigation.resetRoot({ index: 1, routes: [{ name: "Page", params: { name: "home" } }, { name: "Page", params: { name: "account" } }] });
   }
 
   function openGroupOrder(tokens: GroupOpenTokens) {
@@ -892,9 +926,9 @@ function YopidoApp() {
     }
   }
 
-  return (
-    <SafeAreaProvider>
-      <ExpoStatusBar style="light" />
+  function renderScreen(screen: Screen) {
+    return (
+    <View style={{ flex: 1 }}>
       {screen.name === "home" ? (
         <HomeScreen
           activeLocation={activeLocation}
@@ -921,7 +955,7 @@ function YopidoApp() {
         <RestaurantScreen
           customerAccessToken={sessionUser?.accessToken}
           customerStore={customerStore}
-          onBack={() => setScreen({ name: "home" })}
+          onBack={goBack}
           onOpenGroupOrder={(tokens) => openGroupOrder({ ...tokens, restaurantSlug: tokens?.restaurantSlug ?? screen.slug })}
           onRecentOrder={handleRecentOrder}
           onSavedAddress={handleSavedAddress}
@@ -929,6 +963,7 @@ function YopidoApp() {
           onTrack={(order) => setScreen({ name: "orders", ...order })}
           pushRegistration={pushRegistration}
           slug={screen.slug}
+          initialProductId={screen.productId}
         />
       ) : null}
       {screen.name === "orders" ? (
@@ -937,7 +972,7 @@ function YopidoApp() {
           initialOrderId={screen.orderId}
           initialOrderNumber={screen.orderNumber}
           initialTrackingToken={screen.trackingToken}
-          onBack={() => setScreen({ name: "home" })}
+          onBack={goBack}
           pushRegistration={pushRegistration}
           recentOrders={customerStore.recentOrders}
         />
@@ -946,7 +981,7 @@ function YopidoApp() {
         <GroupOrderScreen
           customerStore={customerStore}
           hostAccessToken={screen.hostAccessToken}
-          onBack={() => setScreen({ name: "restaurant", slug: screen.restaurantSlug })}
+          onBack={goBack}
           onRecentOrder={handleRecentOrder}
           onSavedAddress={handleSavedAddress}
           onSessionClosed={forgetGroupSession}
@@ -960,21 +995,38 @@ function YopidoApp() {
       {screen.name === "promos" ? <PromosScreen onOpenRestaurant={(slug) => setScreen({ name: "restaurant", slug })} /> : null}
       {screen.name === "account" ? (
         <AccountScreen
+          onOpenFavorite={(favorite) => setScreen({ name: "restaurant", slug: favorite.restaurantSlug, productId: favorite.kind === "product" ? favorite.entityId : undefined })}
+          panelView={screen.panel ?? "home"}
+          onPanelChange={(panel) => setScreen({ name: "account", panel })}
+          onBack={goBack}
+          onAccountDeleted={handleAccountDeleted}
           customerStore={customerStore}
           notificationMessage={notificationMessage}
           notificationStatus={notificationStatus}
           onChangeStore={updateCustomerStore}
           onEnableNotifications={handleEnableNotifications}
           onSaveAddress={handleSavedAddress}
-          onTestNotification={handleTestNotification}
-          onOpenOrders={() => setScreen({ name: "orders" })}
-          onOpenRestaurant={(slug) => setScreen({ name: "restaurant", slug })}
           onOpenRecentOrder={(order) => setScreen({ name: "orders", customerPhone: order.customerPhone, orderId: order.id, orderNumber: order.orderNumber, trackingToken: order.trackingToken })}
           onToggleFavorite={handleToggleFavorite}
           sessionUser={sessionUser}
         />
       ) : null}
-      {screen.name !== "restaurant" && screen.name !== "group" ? <BottomNav active={screen.name} onNavigate={(name) => setScreen({ name } as Screen)} /> : null}
+      {screen.name !== "restaurant" && screen.name !== "group" ? <BottomNav active={screen.name} onNavigate={switchTab} /> : null}
+    </View>
+    );
+  }
+  return (
+    <SafeAreaProvider>
+      <NavigationContainer ref={navigation}
+        onReady={() => { if (pendingScreen.current) { const next = pendingScreen.current; pendingScreen.current = null; setScreen(next); } }}
+        onStateChange={() => { const route = navigation.getCurrentRoute(); if (route?.params) setCurrentScreen(route.params as Screen); }}>
+        <AppStack.Navigator screenOptions={{ headerShown: false, gestureEnabled: true, contentStyle: { backgroundColor: colors.background } }}>
+          <AppStack.Screen name="Page" initialParams={{ name: "home" }}
+            options={({ route }) => ({ statusBarStyle: route.params.name === "account" ? "dark" : "light" })}>
+            {({ route }) => renderScreen(route.params)}
+          </AppStack.Screen>
+        </AppStack.Navigator>
+      </NavigationContainer>
     </SafeAreaProvider>
   );
 }
@@ -1499,6 +1551,7 @@ function HomeScreen({
 }
 
 function RestaurantScreen({
+  initialProductId,
   slug,
   customerAccessToken,
   customerStore,
@@ -1510,6 +1563,7 @@ function RestaurantScreen({
   onTrack,
   pushRegistration,
 }: {
+  initialProductId?: string;
   slug: string;
   customerAccessToken?: string;
   customerStore: CustomerStore;
@@ -1532,6 +1586,7 @@ function RestaurantScreen({
   const [cartSavedAt, setCartSavedAt] = useState<number | null>(null);
   const [cartDirty, setCartDirty] = useState(false);
   const [selectedProduct, setSelectedProduct] = useState<ProductSummary | null>(null);
+  const openedInitialProduct = useRef(false);
   const [cartOpen, setCartOpen] = useState(false);
   const [restaurantMenuOpen, setRestaurantMenuOpen] = useState(false);
   const [restaurantInfoOpen, setRestaurantInfoOpen] = useState(false);
@@ -1539,6 +1594,14 @@ function RestaurantScreen({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [cartCacheReady, setCartCacheReady] = useState(false);
+
+  useEffect(() => {
+    if (!initialProductId || loading || openedInitialProduct.current) return;
+    openedInitialProduct.current = true;
+    const product = products.find((item) => item.id === initialProductId);
+    if (product) setSelectedProduct(product);
+    else Alert.alert("Plato no disponible", "Este plato ya no está en el catálogo. Puedes elegir otro del local.");
+  }, [initialProductId, loading, products]);
 
   const visibleProducts = useMemo(() => {
     const needle = productQuery.trim().toLowerCase();
@@ -2919,6 +2982,8 @@ function OrdersScreen({
   pushRegistration: PushRegistration | null;
   recentOrders: RecentOrder[];
 }) {
+  const focused = useIsFocused();
+  const trackingRequest = useRef(0);
   const [orderNumber, setOrderNumber] = useState(initialOrderNumber ?? "");
   const [customerPhone, setCustomerPhone] = useState(initialCustomerPhone ?? recentOrders[0]?.customerPhone ?? "");
   const [tracking, setTracking] = useState<MobileTrackingResult | null>(null);
@@ -2927,6 +2992,7 @@ function OrdersScreen({
   const [error, setError] = useState("");
 
   async function loadByToken(orderId: string, trackingToken: string, silent = false, showRefreshIndicator = silent) {
+    const requestId = ++trackingRequest.current;
     if (silent) {
       if (showRefreshIndicator) setRefreshing(true);
     } else {
@@ -2936,15 +3002,16 @@ function OrdersScreen({
     setError("");
     try {
       const nextTracking = await getMobileOrderStatus({ orderId, trackingToken });
+      if (requestId !== trackingRequest.current) return;
       setTracking(nextTracking);
       setOrderNumber(nextTracking.order.orderNumber);
       setCustomerPhone(nextTracking.order.customerPhone);
     } catch (trackError) {
+      if (requestId !== trackingRequest.current) return;
       const message = trackError instanceof Error ? trackError.message : "tracking-failed";
       setError(message === "order-not-found" ? "No encontramos un pedido con esos datos." : "No se pudo rastrear el pedido. Revisa los datos e intenta otra vez.");
     } finally {
-      setLoading(false);
-      setRefreshing(false);
+      if (requestId === trackingRequest.current) { setLoading(false); setRefreshing(false); }
     }
   }
 
@@ -2989,7 +3056,7 @@ function OrdersScreen({
   }, [initialCustomerPhone, initialOrderId, initialOrderNumber, initialTrackingToken]);
 
   useEffect(() => {
-    if (!tracking || isTerminalTracking(tracking.order)) return;
+    if (!focused || !tracking || isTerminalTracking(tracking.order)) return;
     const liveDispatchStatus = tracking.order.deliveryDispatch?.status;
     const intervalMs = liveDispatchStatus === "active" || liveDispatchStatus === "arrived" ? 10000 : 30000;
     const interval = setInterval(() => {
@@ -2998,7 +3065,7 @@ function OrdersScreen({
       }
     }, intervalMs);
     return () => clearInterval(interval);
-  }, [tracking?.order.id, tracking?.order.trackingToken, tracking?.order.status, tracking?.order.deliveryDispatch?.status]);
+  }, [focused, tracking?.order.id, tracking?.order.trackingToken, tracking?.order.status, tracking?.order.deliveryDispatch?.status]);
 
   function openRecentOrder(order: RecentOrder) {
     setOrderNumber(order.orderNumber);
@@ -3091,22 +3158,6 @@ function isTerminalTracking(order: MobileTrackedOrder) {
   return terminalTrackingStatuses.has(order.status) || order.deliveryDispatch?.status === "delivered";
 }
 
-function trackingLabel(order: MobileTrackedOrder) {
-  if (order.status === "cancelled") return "Cancelado";
-  if (order.orderType === "pickup" && order.status === "ready") return "Listo para recoger";
-  if (order.orderType === "delivery" && order.deliveryDispatch?.status === "arrived") return "En camino a tu ubicación";
-  if (order.orderType === "delivery" && order.deliveryDispatch?.status === "active") return "El rider va al punto de recogida";
-  const labels: Record<MobileOrderStatus, string> = {
-    accepted: "Confirmado",
-    cancelled: "Cancelado",
-    delivered: order.orderType === "pickup" ? "Retirado" : "Entregado",
-    pending: "Recibido",
-    preparing: "Preparando",
-    ready: "Listo",
-  };
-  return labels[order.status];
-}
-
 function recentOrderStatusLabel(order: RecentOrder) {
   if (!order.status) return "Guardado";
   if (order.orderType === "pickup" && order.status === "ready") return "Listo para recoger";
@@ -3148,8 +3199,8 @@ function trackingSteps(order: MobileTrackedOrder) {
         { key: "pending", title: "Recibido", description: "Ahora", icon: CheckCircle2 },
         { key: "accepted", title: "Confirmado", description: "El equipo lo aprobo.", icon: ClipboardCheck },
         { key: "preparing", title: "Preparando", description: "Cocina esta trabajando.", icon: ChefHat },
-        { key: "ready", title: "Listo", description: "Sale del local.", icon: PackageCheck },
-        { key: "arrived", title: "Llego", description: "El repartidor marco llegada.", icon: Bike },
+        { key: "ready", title: "Listo para recoger", description: "El local tiene listo el pedido.", icon: PackageCheck },
+        { key: "arrived", title: "En camino a tu dirección", description: "El rider confirmó la recogida.", icon: Bike },
         { key: "delivered", title: "Entregado", description: "Pedido completado.", icon: PackageCheck },
       ];
 
@@ -3159,7 +3210,7 @@ function trackingSteps(order: MobileTrackedOrder) {
 
 function trackingActiveIndex(order: MobileTrackedOrder, keys: string[]) {
   if (order.status === "cancelled") return -1;
-  if (order.deliveryDispatch?.status === "delivered") return keys.indexOf("delivered");
+  if (order.status === "delivered" || order.deliveryDispatch?.status === "delivered") return keys.indexOf("delivered");
   if (order.deliveryDispatch?.status === "arrived") return keys.indexOf("arrived");
   return Math.max(0, keys.indexOf(order.status));
 }
@@ -3178,23 +3229,9 @@ function formatShortTime(value?: string) {
   return new Date(value).toLocaleTimeString("es-BO", { hour: "2-digit", minute: "2-digit" });
 }
 
-function formatRelativeUpdate(value?: string) {
-  if (!value) return "Sin senal reciente";
-  const minutes = Math.max(0, Math.round((Date.now() - new Date(value).getTime()) / 60000));
-  if (minutes <= 0) return "Actualizado ahora";
-  if (minutes === 1) return "Actualizado hace 1 min";
-  return `Actualizado hace ${minutes} min`;
-}
-
 function dispatchCoordinates(order: MobileTrackedOrder) {
   const dispatch = order.deliveryDispatch;
   return coordinates(dispatch?.riderLocation?.latitude ?? dispatch?.riderLatitude, dispatch?.riderLocation?.longitude ?? dispatch?.riderLongitude);
-}
-
-function coordinates(latitudeValue: unknown, longitudeValue: unknown) {
-  const latitude = Number(latitudeValue);
-  const longitude = Number(longitudeValue);
-  return Number.isFinite(latitude) && Number.isFinite(longitude) ? { latitude, longitude } : null;
 }
 
 function dispatchUpdatedAt(order: MobileTrackedOrder) {
@@ -3237,174 +3274,83 @@ function TrackingStatusCard({ onRefresh, refreshing, tracking }: { onRefresh: ()
   const [riderOpen, setRiderOpen] = useState(false);
   const { order, queue, restaurant } = tracking;
   const { activeIndex, steps } = trackingSteps(order);
-  const statusIllustration = order.status === "delivered" ? illustrationOrderSuccess : illustrationOrderStatus;
+  const terminal = isTerminalTracking(order);
   const riderLocation = dispatchCoordinates(order);
   const riderUpdatedAt = dispatchUpdatedAt(order);
   const deliveryLocation = coordinates(order.deliveryLatitude, order.deliveryLongitude);
   const pickupLocation = coordinates(restaurant.latitude, restaurant.longitude);
   const headingToCustomer = order.deliveryDispatch?.status === "arrived";
-  const targetLocation = headingToCustomer ? deliveryLocation : pickupLocation ?? deliveryLocation;
-  const targetLabel = headingToCustomer ? "Tu ubicación" : "Recogida";
+  const targetLocation = headingToCustomer ? deliveryLocation : pickupLocation;
+  const targetLabel = headingToCustomer ? "Dirección de entrega" : "Punto de recogida";
   const targetMapsUrl = headingToCustomer ? order.deliveryMapsUrl : restaurant.mapsUrl;
   const riderDistanceKm = riderLocation && targetLocation ? distanceInKm(riderLocation, targetLocation) : null;
-  const riderEtaMinutes = riderDistanceKm == null ? null : Math.max(2, Math.round((riderDistanceKm / 22) * 60));
   const hasDeliveryOrder = order.orderType === "delivery";
-  const hasRiderDispatch = hasDeliveryOrder && Boolean(order.deliveryDispatch);
-
+  const activeDispatch = order.deliveryDispatch?.status === "active" || order.deliveryDispatch?.status === "arrived";
+  const riderPhone = activeDispatch ? (order.deliveryDispatch?.deliveryPhone ?? "").replace(/[^+0-9]/g, "") : "";
+  const timestamp = riderUpdatedAt ? new Date(riderUpdatedAt).getTime() : NaN;
+  const stale = !Number.isFinite(timestamp) || Date.now() - timestamp > 60000;
   async function contactRestaurant() {
     const digits = (restaurant.whatsapp ?? "").replace(/\D/g, "");
-    if (digits) {
-      await Linking.openURL(`https://wa.me/${digits}`);
-      return;
-    }
-    await Linking.openURL(publicRestaurantUrl(restaurant.slug));
+    await Linking.openURL(digits ? `https://wa.me/${digits}` : publicRestaurantUrl(restaurant.slug)).catch(() => Alert.alert("Contacto", "No se pudo abrir el contacto del local."));
   }
-
-  async function openPickupMap() {
-    await Linking.openURL(googleMapsSearchUrl([restaurant.name, restaurant.city].filter(Boolean).join(", "))).catch(() => undefined);
-  }
-
-  return (
-    <View style={styles.trackingStack}>
-      <View style={styles.trackingHeaderCard}>
-        <RestaurantLogo restaurant={{ name: restaurant.name, logoUrl: restaurant.logoUrl } as RestaurantSummary} size={46} />
-        <View style={styles.trackingHeaderBody}>
-          <Text numberOfLines={1} style={styles.recentOrderName}>{restaurant.name}</Text>
-          <View style={styles.metaRow}>
-            <Store color={colors.muted} size={12} strokeWidth={3} />
-            <Text numberOfLines={1} style={styles.recentOrderMeta}>{restaurant.city || "yopido.shop"}</Text>
-          </View>
-        </View>
-        <IconButton light onPress={onRefresh}>
-          {refreshing ? <ActivityIndicator color={colors.blue} size="small" /> : <Clock3 color={colors.blue} size={19} strokeWidth={3} />}
-        </IconButton>
-      </View>
-
-      <View style={styles.trackingResultCard}>
-        <Text style={styles.eyebrow}>Resumen</Text>
-        <Text style={styles.trackingOrder}>Pedido {order.orderNumber}</Text>
-        <View style={styles.trackingModePill}>
-          <Text style={styles.trackingModeText}>{orderModeLabel(order.orderType)}</Text>
-        </View>
-        {order.orderType === "pickup" ? (
-          <Pressable onPress={openPickupMap} style={({ pressed }) => [styles.trackingMapButton, pressed && styles.pressedCard]}>
-            <MapPinned color={colors.blue} size={18} strokeWidth={3} />
-            <Text style={styles.trackingMapButtonText}>Ver ubicacion del local</Text>
-          </Pressable>
-        ) : null}
-
-        <Pressable onPress={() => setProductsOpen((current) => !current)} style={styles.trackingProductsToggle}>
-          <Text style={styles.trackingProductsText}>Ver productos</Text>
-          <Text style={styles.trackingProductsCount}>{order.items.length}</Text>
-        </Pressable>
-        {productsOpen ? (
-          <View style={styles.trackingProductsList}>
-            {order.items.map((item) => (
-              <View key={item.id} style={styles.trackingProductLine}>
-                <View style={styles.trackingProductThumb}>
-                  <ShoppingBag color={colors.blue} size={18} strokeWidth={3} />
-                </View>
-                <View style={styles.trackingProductBody}>
-                  <Text numberOfLines={1} style={styles.trackingProductName}>{item.productName}</Text>
-                  {item.notes ? <Text numberOfLines={1} style={styles.trackingProductNotes}>{item.notes}</Text> : null}
-                  <Text style={styles.trackingProductNotes}>{formatBs(Number(item.unitPrice))} c/u</Text>
-                </View>
-                <Text style={styles.trackingProductQty}>x{item.quantity}</Text>
-              </View>
-            ))}
-          </View>
-        ) : null}
-
-        <View style={styles.trackingTotalBox}>
-          <Text style={styles.trackingTotalLabel}>Total</Text>
-          <Text style={styles.trackingTotal}>{formatBs(Number(order.total))}</Text>
-        </View>
-        {hasDeliveryOrder ? (
-          <Pressable onPress={() => setRiderOpen(true)} style={({ pressed }) => [styles.riderLiveButton, pressed && styles.pressedCard]}>
-            <View style={styles.riderLiveIcon}>
-              {riderLocation ? <MapPinned color={colors.blue} size={19} strokeWidth={3} /> : <Eye color={colors.blue} size={19} strokeWidth={3} />}
-            </View>
-            <View style={styles.riderLiveBody}>
-              <Text style={styles.riderLiveTitle}>{riderLocation ? "Ver mapa en vivo" : hasRiderDispatch ? "Rider asignado" : "Esperando rider"}</Text>
-              <Text numberOfLines={1} style={styles.riderLiveText}>
-                {riderLocation
-                  ? `${formatRelativeUpdate(riderUpdatedAt)}${riderEtaMinutes ? ` | aprox. ${riderEtaMinutes} min` : ""}`
-                  : hasRiderDispatch
-                    ? "Esperando senal de ubicacion"
-                    : "Aparecera aqui cuando acepte el pedido"}
-              </Text>
-            </View>
-            <ArrowRight color={colors.blue} size={18} strokeWidth={3} />
-          </Pressable>
-        ) : null}
-        {hasDeliveryOrder && (riderLocation || targetLocation) ? <RiderLiveMap riderLocation={riderLocation} targetLabel={targetLabel} targetLocation={targetLocation} compact /> : null}
-        <PrimaryButton icon={<MessageCircle color={colors.blue} size={18} strokeWidth={3} />} onPress={contactRestaurant} text="Contactar restaurante" />
-      </View>
-
-      <View>
-        <Text style={styles.trackingSectionTitle}>Seguimiento del pedido</Text>
-        <Text style={styles.trackingSectionSub}>Pedido {order.orderNumber}</Text>
-        <View style={styles.trackingStatusPill}>
-          <Text style={styles.trackingStatusPillText}>{trackingLabel(order)}</Text>
-        </View>
-      </View>
-
-      <View style={styles.trackingStateCard}>
-        <Image source={statusIllustration} style={styles.trackingIllustration} />
-        <View style={styles.trackingStateIntro}>
-          <View style={styles.trackingModePill}>
-            <Text style={styles.trackingModeText}>{orderModeLabel(order.orderType)}</Text>
-          </View>
-          <Text style={styles.trackingStateTitle}>Seguimiento por estados</Text>
-        </View>
-
-        {order.status === "cancelled" ? (
-        <View style={styles.cancelledBox}>
-          <Text style={styles.cancelledText}>Pedido cancelado{order.cancellationReason ? `: ${order.cancellationReason}` : ""}</Text>
-        </View>
-      ) : (
-        <View style={styles.trackingSteps}>
-          {steps.map((step, index) => {
-            const active = index <= activeIndex;
-            const current = index === activeIndex;
-            const Icon = step.icon;
-            return (
-              <View key={step.key} style={[styles.trackingStep, current && styles.trackingStepCurrent]}>
-                <View style={[styles.trackingDot, active && styles.trackingDotActive]}>
-                  <Icon color={active ? colors.blue : "#8D9AAF"} size={18} strokeWidth={2.8} />
-                </View>
-                <View style={styles.trackingStepBody}>
-                  <Text style={[styles.trackingStepText, active && styles.trackingStepTextActive]}>{step.title}</Text>
-                  <Text style={styles.trackingStepDescription}>{step.description}</Text>
-                </View>
-              </View>
-            );
-          })}
-        </View>
-      )}
-      </View>
-
-      {queue?.queueEnabled && order.status !== "cancelled" ? <VirtualQueueMobileCard order={order} queue={queue} /> : null}
-      {riderOpen ? (
-        <RiderLiveTrackingSheet
-          distanceKm={riderDistanceKm}
-          etaMinutes={riderEtaMinutes}
-          onClose={() => setRiderOpen(false)}
-          order={order}
-          riderLocation={riderLocation}
-          riderUpdatedAt={riderUpdatedAt}
-          targetLabel={targetLabel}
-          targetLocation={targetLocation}
-          targetMapsUrl={targetMapsUrl}
-        />
-      ) : null}
+  return <View style={styles.trackingStack}>
+    <View style={styles.trackingHeaderCard}>
+      <RestaurantLogo restaurant={{ name: restaurant.name, logoUrl: restaurant.logoUrl } as RestaurantSummary} size={48} />
+      <View style={styles.recentOrderBody}><Text style={styles.recentOrderName}>{restaurant.name}</Text><Text style={styles.recentOrderMeta}>Pedido {order.orderNumber}</Text></View>
+      <IconButton light onPress={onRefresh}>{refreshing ? <ActivityIndicator color={colors.blue} /> : <Clock3 color={colors.blue} size={22} />}</IconButton>
     </View>
-  );
+    <View style={styles.accountCard}>
+      <Text style={styles.eyebrow}>{orderModeLabel(order.orderType)}</Text>
+      <Text style={styles.accountTopTitle}>{trackingLabel(order)}</Text>
+      {order.status === "cancelled" ? <Text style={styles.submitError}>{order.cancellationReason || "Este pedido fue cancelado."}</Text> : null}
+      {hasDeliveryOrder && !terminal ? <>
+        <Text style={styles.accountHint}>{activeDispatch ? headingToCustomer ? "El rider ya recogió tu pedido y va a la dirección de entrega." : "El rider va al local a recoger tu pedido." : "Aquí verás al rider cuando acepte y comparta su ubicación."}</Text>
+        <RiderLiveMap riderLocation={activeDispatch ? riderLocation : null} targetLabel={targetLabel} targetLocation={targetLocation} pickupLocation={pickupLocation} deliveryLocation={deliveryLocation} />
+        <View style={styles.accountIdentityRow}>
+          <View style={styles.accountRowIcon}><Bike color={colors.blue} size={24} /></View>
+          <View style={styles.recentOrderBody}>
+            <Text style={styles.recentOrderName}>{activeDispatch ? order.deliveryDispatch?.deliveryName || "Tu rider" : "Esperando rider"}</Text>
+            <Text style={styles.accountHint}>{activeDispatch && riderLocation ? `${stale ? "Última señal · " : ""}${formatRelativeUpdate(riderUpdatedAt)}` : "Ubicación aún no disponible"}</Text>
+          </View>
+          {riderPhone ? <Pressable accessibilityLabel="Llamar al rider" onPress={() => void Linking.openURL(`tel:${riderPhone}`).catch(() => Alert.alert("Llamada", "No se pudo abrir el teléfono."))} style={styles.accountHeaderButton}><Phone color={colors.blue} size={20} /></Pressable> : null}
+        </View>
+        <PrimaryButton onPress={() => setRiderOpen(true)} text="Ampliar seguimiento" />
+      </> : null}
+      <View style={styles.savedAddressCard}>
+        <Text style={styles.accountSectionLabel}>PUNTO DE RECOGIDA</Text>
+        <Text style={styles.recentOrderName}>{restaurant.name}</Text>
+        {restaurant.address ? <Text style={styles.accountHint}>{restaurant.address}</Text> : null}
+        {hasDeliveryOrder ? <><Text style={styles.accountSectionLabel}>DIRECCIÓN DE ENTREGA</Text><Text style={styles.accountAddressText}>{order.customerAddress || "Dirección no disponible"}</Text>{order.deliveryAddressDetail ? <Text style={styles.accountHint}>{order.deliveryAddressDetail}</Text> : null}</> : <Pressable style={styles.addressTextButton} onPress={() => void Linking.openURL(restaurant.mapsUrl || (pickupLocation ? googleMapsUrl(pickupLocation.latitude, pickupLocation.longitude) : googleMapsSearchUrl(`${restaurant.name}, ${restaurant.city}`))).catch(() => undefined)}><MapPin color={colors.blue} size={20} /><Text style={styles.accountSmallActionText}>Ver ubicación del local</Text></Pressable>}
+      </View>
+    </View>
+    {!terminal && queue?.queueEnabled ? <VirtualQueueMobileCard order={order} queue={queue} /> : null}
+    {order.status !== "cancelled" ? <View style={styles.accountCard}>
+      <Text style={styles.accountName}>Estado del pedido</Text>
+      {steps.map((step, index) => {
+        const Icon = step.icon;
+        const active = index <= activeIndex;
+        return <View key={step.key} style={styles.trackingStep}>
+          <View style={[styles.trackingDot, active && styles.trackingDotActive]}><Icon color={active ? colors.blue : colors.muted} size={19} /></View>
+          <View style={styles.recentOrderBody}><Text style={[styles.trackingStepText, active && styles.trackingStepTextActive]}>{step.title}</Text>{index === activeIndex ? <Text style={styles.accountHint}>{step.description}</Text> : null}</View>
+        </View>;
+      })}
+    </View> : null}
+    <View style={styles.accountCard}>
+      <Pressable onPress={() => setProductsOpen(!productsOpen)} style={styles.accountSectionActionRow}><Text style={styles.accountName}>Resumen del pedido</Text><ChevronDown color={colors.blue} size={22} /></Pressable>
+      {productsOpen ? order.items.map((item) => <View key={item.id} style={styles.accountSectionActionRow}><View style={styles.recentOrderBody}><Text style={styles.accountAddressText}>{item.quantity} × {item.productName}</Text>{item.notes ? <Text style={styles.accountHint}>{item.notes}</Text> : null}</View><Text style={styles.accountAddressText}>{formatBs(Number(item.subtotal))}</Text></View>) : <Text style={styles.accountHint}>{order.items.reduce((sum, item) => sum + item.quantity, 0)} productos · Toca para ver el detalle</Text>}
+      <TotalLine label="Productos" value={formatBs(Number(order.subtotal))} />
+      {hasDeliveryOrder ? <TotalLine label="Envío" value={formatBs(Number(order.deliveryFee))} /> : null}
+      {Number(order.discountTotal) > 0 ? <TotalLine label="Descuento" value={`−${formatBs(Number(order.discountTotal))}`} /> : null}
+      <TotalLine strong label="Total" value={formatBs(Number(order.total))} />
+      <PrimaryButton icon={<MessageCircle color={colors.blue} size={18} />} onPress={contactRestaurant} text="Contactar restaurante" />
+    </View>
+    {riderOpen ? <RiderLiveTrackingSheet distanceKm={riderDistanceKm} onClose={() => setRiderOpen(false)} order={order} riderLocation={activeDispatch ? riderLocation : null} riderUpdatedAt={riderUpdatedAt} targetLabel={targetLabel} targetLocation={targetLocation} targetMapsUrl={targetMapsUrl} pickupLocation={pickupLocation} deliveryLocation={deliveryLocation} /> : null}
+  </View>;
 }
 
 function RiderLiveTrackingSheet({
   distanceKm,
-  etaMinutes,
+  pickupLocation, deliveryLocation,
   onClose,
   order,
   riderLocation,
@@ -3414,7 +3360,8 @@ function RiderLiveTrackingSheet({
   targetMapsUrl,
 }: {
   distanceKm: number | null;
-  etaMinutes: number | null;
+  pickupLocation: DeliveryPoint;
+  deliveryLocation: DeliveryPoint;
   onClose: () => void;
   order: MobileTrackedOrder;
   riderLocation: { latitude: number; longitude: number } | null;
@@ -3423,13 +3370,14 @@ function RiderLiveTrackingSheet({
   targetLocation: { latitude: number; longitude: number } | null;
   targetMapsUrl?: string;
 }) {
+  const insets = useSafeAreaInsets();
   async function openRoute() {
     if (riderLocation && targetLocation) {
       await Linking.openURL(`https://www.google.com/maps/dir/?api=1&origin=${riderLocation.latitude},${riderLocation.longitude}&destination=${targetLocation.latitude},${targetLocation.longitude}`).catch(() => undefined);
       return;
     }
-    if (targetMapsUrl) {
-      await Linking.openURL(targetMapsUrl).catch(() => undefined);
+    if (targetMapsUrl || targetLocation) {
+      await Linking.openURL(targetMapsUrl || googleMapsUrl(targetLocation!.latitude, targetLocation!.longitude)).catch(() => undefined);
     }
   }
 
@@ -3438,6 +3386,7 @@ function RiderLiveTrackingSheet({
       <View style={styles.modalOverlay}>
         <Pressable style={StyleSheet.absoluteFill} onPress={onClose} />
         <View style={styles.riderSheet}>
+          <ScrollView style={{ flexShrink: 1 }} contentContainerStyle={{ paddingBottom: insets.bottom }}>
           <View style={styles.mapPickerHandle} />
           <View style={styles.riderSheetHeader}>
             <View>
@@ -3447,16 +3396,16 @@ function RiderLiveTrackingSheet({
             <IconButton light onPress={onClose}><X color={colors.blue} size={21} strokeWidth={3} /></IconButton>
           </View>
 
-          <RiderLiveMap riderLocation={riderLocation} targetLabel={targetLabel} targetLocation={targetLocation} />
+          <RiderLiveMap riderLocation={riderLocation} targetLabel={targetLabel} targetLocation={targetLocation} pickupLocation={pickupLocation} deliveryLocation={deliveryLocation} />
 
           <View style={styles.riderStatsRow}>
             <View style={styles.riderStatCard}>
-              <Text style={styles.riderStatLabel}>Distancia</Text>
+              <Text style={styles.riderStatLabel}>En línea recta</Text>
               <Text style={styles.riderStatValue}>{distanceKm == null ? "Calculando" : formatDistance(distanceKm)}</Text>
             </View>
             <View style={styles.riderStatCard}>
-              <Text style={styles.riderStatLabel}>Hasta {targetLabel.toLowerCase()}</Text>
-              <Text style={styles.riderStatValue}>{etaMinutes == null ? "En ruta" : `${etaMinutes} min`}</Text>
+              <Text style={styles.riderStatLabel}>Estado del reparto</Text>
+              <Text style={styles.riderStatValue}>{order.deliveryDispatch?.status === "arrived" ? "Pedido recogido" : order.deliveryDispatch?.status === "active" ? "Hacia el local" : "Esperando rider"}</Text>
             </View>
           </View>
 
@@ -3469,6 +3418,7 @@ function RiderLiveTrackingSheet({
           </View>
 
           <PrimaryButton disabled={!targetLocation && !targetMapsUrl} icon={<MapPinned color={colors.blue} size={18} strokeWidth={3} />} onPress={openRoute} text={`Ver ${targetLabel.toLowerCase()}`} />
+          </ScrollView>
         </View>
       </View>
     </Modal>
@@ -3480,33 +3430,66 @@ function RiderLiveMap({
   targetLabel,
   targetLocation,
   compact = false,
+  pickupLocation = null, deliveryLocation = null,
 }: {
   riderLocation: { latitude: number; longitude: number } | null;
   targetLabel: string;
   targetLocation: { latitude: number; longitude: number } | null;
   compact?: boolean;
+  pickupLocation?: DeliveryPoint;
+  deliveryLocation?: DeliveryPoint;
 }) {
   const useWebMap = Platform.OS === "android";
+  const browserMap = Platform.OS === "web";
   let NativeMapView: any = null;
   let NativeMarker: any = null;
-  let NativePolyline: any = null;
 
-  if (!useWebMap) {
+
+  if (!useWebMap && !browserMap) {
     try {
       const nativeMaps = require("react-native-maps");
       NativeMapView = nativeMaps.default;
       NativeMarker = nativeMaps.Marker;
-      NativePolyline = nativeMaps.Polyline;
+
     } catch {
       NativeMapView = null;
     }
   }
 
   const mapRef = useRef<any>(null);
+  const webRef = useRef<WebView>(null);
+  const frameRef = useRef<HTMLIFrameElement>(null);
+  const [webReady, setWebReady] = useState(false);
+  const [mapFailed, setMapFailed] = useState(false);
+  const [mapAttempt, setMapAttempt] = useState(0);
   const [mapReady, setMapReady] = useState(false);
   const fallback = riderLocation ?? targetLocation ?? { latitude: -17.3895, longitude: -66.1568 };
-  const points = [riderLocation, targetLocation].filter(Boolean) as Array<{ latitude: number; longitude: number }>;
-  const webMapHtml = useMemo(() => leafletLiveDeliveryHtml(riderLocation, targetLocation, targetLabel), [riderLocation?.latitude, riderLocation?.longitude, targetLabel, targetLocation?.latitude, targetLocation?.longitude]);
+  const points = [riderLocation, pickupLocation, deliveryLocation, targetLocation].filter(Boolean) as Array<{ latitude: number; longitude: number }>;
+  const webMapHtml = useMemo(() => leafletLiveDeliveryHtml(), []);
+  useEffect(() => {
+    if (!browserMap) return;
+    const listener = (event: MessageEvent) => {
+      if (event.source === frameRef.current?.contentWindow && event.data?.type === "yopido-map-ready") { setWebReady(true); setMapFailed(false); }
+    };
+    window.addEventListener("message", listener);
+    return () => window.removeEventListener("message", listener);
+  }, [browserMap]);
+  useEffect(() => {
+    if (!webReady) return;
+    const data = { rider: riderLocation, pickup: pickupLocation, delivery: deliveryLocation };
+    if (browserMap) frameRef.current?.contentWindow?.postMessage({ type: "yopido-map-update", points: data }, "*");
+    webRef.current?.injectJavaScript(`window.updateYopidoDelivery && window.updateYopidoDelivery(${JSON.stringify(data)}); true;`);
+  }, [webReady, riderLocation?.latitude, riderLocation?.longitude, pickupLocation?.latitude, pickupLocation?.longitude, deliveryLocation?.latitude, deliveryLocation?.longitude]);
+  useEffect(() => {
+    if ((!useWebMap && !browserMap) || webReady) return;
+    const timer = setTimeout(() => setMapFailed(true), 12000);
+    return () => clearTimeout(timer);
+  }, [useWebMap, browserMap, webReady, mapAttempt]);
+  function recenter() {
+    if (browserMap) { frameRef.current?.contentWindow?.postMessage({ type: "yopido-map-center" }, "*"); return; }
+    if (useWebMap) webRef.current?.injectJavaScript("window.fitYopidoDelivery && window.fitYopidoDelivery(); true;");
+    else if (points.length) mapRef.current?.fitToCoordinates(points, { edgePadding: { top: 45, bottom: 45, left: 45, right: 45 }, animated: true });
+  }
 
   useEffect(() => {
     if (useWebMap || !NativeMapView || !mapReady || !mapRef.current || !points.length) return;
@@ -3538,8 +3521,14 @@ function RiderLiveMap({
 
   return (
     <View style={[styles.riderMapCanvas, compact && styles.riderMapCanvasInline]}>
+      {mapFailed ? <View style={styles.mapUnavailable}><Text style={styles.accountHint}>No pudimos cargar el mapa.</Text><Pressable style={styles.addressTextButton} onPress={() => { setMapFailed(false); setWebReady(false); setMapAttempt((value) => value + 1); }}><Text style={styles.accountSmallActionText}>Reintentar</Text></Pressable></View> : null}
       {useWebMap ? (
         <WebView
+          applicationNameForUserAgent="YopidoMobile/1.1 (+https://yopido.shop)"
+          key={mapAttempt}
+          ref={webRef}
+          onMessage={(event) => { if (event.nativeEvent.data === "map-ready") { setWebReady(true); setMapFailed(false); } }}
+          onError={() => setMapFailed(true)}
           domStorageEnabled
           javaScriptEnabled
           mixedContentMode="always"
@@ -3550,6 +3539,8 @@ function RiderLiveMap({
           source={{ html: webMapHtml, baseUrl: "https://yopido.shop" }}
           style={StyleSheet.absoluteFill}
         />
+      ) : browserMap ? (
+        <iframe key={mapAttempt} ref={frameRef} title="Mapa del pedido" srcDoc={webMapHtml} style={{ width: "100%", height: "100%", border: 0 }} />
       ) : NativeMapView ? (
         <NativeMapView
           ref={mapRef}
@@ -3568,16 +3559,11 @@ function RiderLiveMap({
           toolbarEnabled={false}
         >
           {riderLocation ? <NativeMarker coordinate={riderLocation} title="Rider" pinColor={colors.green} /> : null}
-          {targetLocation ? <NativeMarker coordinate={targetLocation} title={targetLabel} pinColor={colors.blue} /> : null}
-          {points.length > 1 ? <NativePolyline coordinates={points} strokeColor={colors.blue} strokeWidth={4} /> : null}
+          {pickupLocation ? <NativeMarker coordinate={pickupLocation} title="Punto de recogida" pinColor={colors.blue} /> : null}
+          {deliveryLocation ? <NativeMarker coordinate={deliveryLocation} title="Dirección de entrega" pinColor={colors.blue} /> : null}
         </NativeMapView>
       ) : (
-        <>
-          <View style={styles.mapGridVertical} />
-          <View style={styles.mapGridHorizontal} />
-          <View style={styles.mapRoadOne} />
-          <View style={styles.mapRoadTwo} />
-        </>
+        <View style={styles.mapUnavailable}><Text style={styles.accountHint}>El mapa no está disponible. Puedes abrir la ubicación desde el seguimiento.</Text></View>
       )}
       {!riderLocation ? (
         <View style={styles.riderMapEmpty}>
@@ -3585,6 +3571,7 @@ function RiderLiveMap({
           <Text style={styles.riderMapEmptyText}>Esperando senal del rider</Text>
         </View>
       ) : null}
+      <Pressable accessibilityLabel="Centrar mapa en el pedido" onPress={recenter} style={styles.mapRecenter}><Navigation color={colors.blue} size={21} /></Pressable>
     </View>
   );
 }
@@ -3723,29 +3710,29 @@ function PromosScreen({ onOpenRestaurant }: { onOpenRestaurant: (slug: string) =
 }
 
 function AccountScreen({
+  onOpenFavorite, panelView, onPanelChange, onBack, onAccountDeleted,
   customerStore,
   notificationMessage,
   notificationStatus,
   onChangeStore,
   onEnableNotifications,
   onSaveAddress,
-  onTestNotification,
   sessionUser,
-  onOpenOrders,
-  onOpenRestaurant,
   onOpenRecentOrder,
   onToggleFavorite,
 }: {
+  onOpenFavorite: (favorite: SavedFavorite) => void;
+  panelView: AccountPanelView;
+  onPanelChange: (panel: AccountPanelView) => void;
+  onBack: () => void;
+  onAccountDeleted: () => Promise<void>;
   customerStore: CustomerStore;
   notificationMessage: string;
   notificationStatus: NotificationStatus;
   onChangeStore: (store: CustomerStore) => void | Promise<void>;
   onEnableNotifications: () => Promise<PushRegistrationResult>;
   onSaveAddress: (address: Omit<SavedAddress, "id" | "updatedAt">) => Promise<SavedAddress[]>;
-  onTestNotification: () => Promise<LocalNotificationResult>;
   sessionUser: SessionUser | null;
-  onOpenOrders: () => void;
-  onOpenRestaurant: (slug: string) => void;
   onOpenRecentOrder: (order: RecentOrder) => void;
   onToggleFavorite: (favorite: SavedFavorite) => void | Promise<void>;
 }) {
@@ -3761,11 +3748,17 @@ function AccountScreen({
   const [addressSaving, setAddressSaving] = useState(false);
   const [profileEditorOpen, setProfileEditorOpen] = useState(false);
   const [addressPickerOpen, setAddressPickerOpen] = useState(false);
-  const [panelView, setPanelView] = useState<AccountPanelView>("home");
+  const setPanelView = onPanelChange;
+  const focused = useIsFocused();
+  const [editingAddress, setEditingAddress] = useState<SavedAddress | null>(null);
+  const [addressToDelete, setAddressToDelete] = useState<SavedAddress | null>(null);
+  const [deletingAccount, setDeletingAccount] = useState(false);
+  const [deleteAccountOpen, setDeleteAccountOpen] = useState(false);
+  const [deleteConfirmation, setDeleteConfirmation] = useState("");
+  const [locationPermission, setLocationPermission] = useState("Revisando permiso…");
   const [orderFilter, setOrderFilter] = useState<OrderHistoryFilter>("all");
   const [favoriteFilter, setFavoriteFilter] = useState<FavoriteFilter>("all");
   const [notificationSaving, setNotificationSaving] = useState(false);
-  const [notificationTesting, setNotificationTesting] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
   const [successMessage, setSuccessMessage] = useState("");
 
@@ -3806,23 +3799,16 @@ function AccountScreen({
   }, [customerStore.favorites, favoriteFilter]);
 
   useEffect(() => {
-    if (!sessionUser) {
-      setPanelView("home");
-    }
-  }, [sessionUser]);
-
-  useEffect(() => {
-    const subscription = BackHandler.addEventListener("hardwareBackPress", () => {
-      if (panelView !== "home") {
-        setPanelView("home");
-        setErrorMessage("");
-        setSuccessMessage("");
-        return true;
-      }
-      return false;
-    });
-    return () => subscription.remove();
-  }, [panelView]);
+    if (!focused || panelView !== "settings") return;
+    const refresh = () => {
+      void Location.getForegroundPermissionsAsync().then((permission) => {
+        setLocationPermission(permission.granted ? "Permitida al usar la app" : "Sin permiso de ubicación");
+      }).catch(() => setLocationPermission("No se pudo consultar el permiso"));
+    };
+    refresh();
+    const listener = AppState.addEventListener("change", (state) => { if (state === "active") refresh(); });
+    return () => listener.remove();
+  }, [focused, panelView]);
 
   async function submitAuth() {
     setLoading(true);
@@ -3927,17 +3913,21 @@ function AccountScreen({
         return;
       }
       if (sessionUser?.accessToken) {
-        const response = await createCustomerAddress(sessionUser.accessToken, {
+        const payload = {
           address: location.label,
           apartment: details?.apartment.trim() || undefined,
           buildingName: details?.buildingName.trim() || undefined,
-          isDefault: addressCount === 0,
+          isDefault: editingAddress?.isDefault ?? addressCount === 0,
           label,
           latitude: location.latitude,
           longitude: location.longitude,
           mapsUrl: location.mapsUrl,
           reference,
-        });
+          city: editingAddress?.city,
+        };
+        const response = editingAddress
+          ? await updateCustomerAddress(sessionUser.accessToken, editingAddress.id, payload)
+          : await createCustomerAddress(sessionUser.accessToken, payload);
         await onChangeStore({
           ...customerStore,
           addresses: response.addresses.map(mapCustomerAddressToSavedAddress),
@@ -3956,7 +3946,8 @@ function AccountScreen({
       }
 
       setAddressPickerOpen(false);
-      setSuccessMessage("Direccion guardada.");
+      setEditingAddress(null);
+      setSuccessMessage("Dirección guardada.");
     } catch (error) {
       setErrorMessage(customerErrorMessage(error));
     } finally {
@@ -3985,29 +3976,51 @@ function AccountScreen({
     }
   }
 
-  async function testNotificationsFromAccount() {
-    setNotificationTesting(true);
-    setErrorMessage("");
-    setSuccessMessage("");
-    try {
-      const result = await onTestNotification();
-      if (result.ok) {
-        setSuccessMessage(result.message);
-      } else {
-        setErrorMessage(result.message);
-      }
-    } finally {
-      setNotificationTesting(false);
-    }
-  }
-
   function openAddressPicker() {
     if (!profileComplete) {
       setSuccessMessage("");
       setErrorMessage("Primero guarda tus datos para asociar direcciones a tu cuenta.");
       return;
     }
+    setEditingAddress(null);
+    setErrorMessage("");
     setAddressPickerOpen(true);
+  }
+
+  async function changeAddress(address: SavedAddress, action: "default" | "delete") {
+    if (!sessionUser?.accessToken || addressSaving) return;
+    setAddressSaving(true); setErrorMessage(""); setSuccessMessage("");
+    try {
+      const response = action === "delete"
+        ? await deleteCustomerAddress(sessionUser.accessToken, address.id)
+        : await updateCustomerAddress(sessionUser.accessToken, address.id);
+      await onChangeStore({ ...customerStore, addresses: response.addresses.map(mapCustomerAddressToSavedAddress) });
+      if (action === "delete") setAddressToDelete(null);
+      setSuccessMessage(action === "delete" ? "Dirección eliminada." : "Dirección principal actualizada.");
+    } catch (error) { setErrorMessage(customerErrorMessage(error)); }
+    finally { setAddressSaving(false); }
+  }
+
+  function confirmDeleteAddress(address: SavedAddress) { setErrorMessage(""); setAddressToDelete(address); }
+
+  async function removeAccount() {
+    if (!sessionUser?.accessToken || deleteConfirmation !== "ELIMINAR" || deletingAccount) return;
+    setDeletingAccount(true); setErrorMessage("");
+    try {
+      await deleteCustomerAccount(sessionUser.accessToken);
+      await onAccountDeleted();
+    } catch (error) { setErrorMessage(customerErrorMessage(error)); }
+    finally { setDeletingAccount(false); }
+  }
+
+  async function enableLocation() {
+    try {
+      const current = await Location.getForegroundPermissionsAsync();
+      if (current.granted) { await Linking.openSettings(); return; }
+      const permission = await Location.requestForegroundPermissionsAsync();
+      setLocationPermission(permission.granted ? "Permitida al usar la app" : "Sin permiso de ubicación");
+      if (!permission.granted) await Linking.openSettings();
+    } catch { setErrorMessage("No pudimos abrir los permisos de ubicación. Revisa los ajustes del teléfono."); }
   }
 
   function openProfileEditor() {
@@ -4028,7 +4041,7 @@ function AccountScreen({
   }
 
   return (
-    <SafeAreaView edges={["top"]} style={styles.safeBlue}>
+    <SafeAreaView edges={["top"]} style={styles.accountSafe}>
       <ScrollView
         alwaysBounceVertical={false}
         bounces={false}
@@ -4036,16 +4049,21 @@ function AccountScreen({
         overScrollMode="never"
         style={styles.accountPage}
       >
-        <View style={styles.accountHero}>
-          <View style={styles.accountHeroTop}>
-            <Image resizeMode="contain" source={logoDark} style={styles.accountHeroLogo} />
-            <View style={styles.accountHeroIcon}>
-              <UserRound color="#FFFFFF" size={22} strokeWidth={3} />
-            </View>
+        <View style={[styles.accountTopBar, panelView === "home" && styles.accountTopBarHome]}>
+          {panelView !== "home" ? (
+            <Pressable accessibilityRole="button" accessibilityLabel="Volver a Mi Yopido" onPress={onBack} style={styles.accountHeaderButton}>
+              <ChevronLeft color={colors.blue} size={25} />
+            </Pressable>
+          ) : null}
+          <View style={styles.recentOrderBody}>
+            <Image source={logoDark} resizeMode="contain" style={{ width: 120, height: 25, tintColor: colors.blue }} />
+            {panelView !== "home" ? <Text style={styles.accountTopTitle}>{({ addresses: "Mis direcciones", orders: "Mis pedidos", favorites: "Mis favoritos", settings: "Configuración", help: "Ayuda" })[panelView]}</Text> : null}
           </View>
-          <Text style={styles.accountHeroEyebrow}>Mi Yopido</Text>
-          <Text style={styles.accountGreeting}>{greetingName ? `Hola ${greetingName}, bienvenido` : "Hola, bienvenido"}</Text>
-          <Text style={styles.accountHeroCopy}>Tus pedidos, direcciones y datos listos para comprar mas rapido.</Text>
+          {sessionUser && panelView === "home" ? (
+            <Pressable accessibilityRole="button" accessibilityLabel="Configuración" onPress={() => setPanelView("settings")} style={styles.accountHeaderButton}>
+              <Settings color={colors.blue} size={23} />
+            </Pressable>
+          ) : null}
         </View>
 
         {!sessionUser ? (
@@ -4086,7 +4104,7 @@ function AccountScreen({
           <>
             <View style={styles.accountCard}>
               <View style={styles.accountSectionActionRow}>
-                <AccountSubHeader eyebrow="Direcciones" title="Mis direcciones" />
+                <Text style={styles.accountName}>Tus lugares</Text>
                 <Pressable
                   accessibilityLabel="Agregar direccion"
                   disabled={addressSaving || !profileComplete}
@@ -4104,18 +4122,27 @@ function AccountScreen({
 
             <View style={styles.accountCard}>
               <View style={styles.accountSectionActionRow}>
-                <SectionTitle eyebrow="Guardadas" title={`${addressCount} direcciones`} />
+                <Text style={styles.accountSectionLabel}>{addressCount} {addressCount === 1 ? "DIRECCIÓN GUARDADA" : "DIRECCIONES GUARDADAS"}</Text>
               </View>
               {customerStore.addresses.length ? customerStore.addresses.map((address) => (
-                <View key={address.id} style={styles.addressRow}>
-                  <View style={styles.accountRowIcon}>
-                    <MapPin color={colors.blue} size={17} strokeWidth={3} />
+                <View key={address.id} style={styles.savedAddressCard}>
+                  <View style={styles.accountIdentityRow}>
+                    <View style={styles.accountRowIcon}><MapPin color={colors.blue} size={21} /></View>
+                    <View style={styles.recentOrderBody}>
+                      <Text style={styles.recentOrderName}>{address.label}</Text>
+                      {address.isDefault ? <Text style={styles.accountDefaultLabel}>Dirección principal</Text> : null}
+                    </View>
+                    <Pressable disabled={addressSaving} accessibilityRole="button" accessibilityLabel={`Editar ${address.label}`}
+                      onPress={() => { setEditingAddress(address); setErrorMessage(""); setAddressPickerOpen(true); }} style={styles.accountHeaderButton}>
+                      <Pencil color={colors.blue} size={18} />
+                    </Pressable>
                   </View>
-                  <View style={styles.recentOrderBody}>
-                    <Text numberOfLines={1} style={styles.recentOrderName}>{address.label}</Text>
-                    <Text numberOfLines={2} style={styles.recentOrderMeta}>{address.address}</Text>
-                    {address.buildingName || address.apartment ? <Text numberOfLines={1} style={styles.addressDetail}>{[address.buildingName, address.apartment].filter(Boolean).join(" | ")}</Text> : null}
-                    {address.reference ? <Text numberOfLines={2} style={styles.addressReference}>{address.reference}</Text> : null}
+                  <Text style={styles.accountAddressText}>{address.address}</Text>
+                  {address.buildingName || address.apartment ? <Text style={styles.accountHint}>{[address.buildingName, address.apartment].filter(Boolean).join(" · ")}</Text> : null}
+                  {address.reference ? <Text style={styles.accountHint}>{address.reference}</Text> : null}
+                  <View style={styles.addressActions}>
+                    {!address.isDefault ? <Pressable disabled={addressSaving} onPress={() => void changeAddress(address, "default")} style={styles.addressTextButton}><Text style={styles.accountSmallActionText}>Usar como principal</Text></Pressable> : <View style={{ flex: 1 }} />}
+                    <Pressable disabled={addressSaving} onPress={() => confirmDeleteAddress(address)} accessibilityLabel={`Eliminar ${address.label}`} style={styles.accountHeaderButton}><Trash2 color={colors.danger} size={18} /></Pressable>
                   </View>
                 </View>
               )) : (
@@ -4126,8 +4153,8 @@ function AccountScreen({
         ) : panelView === "orders" ? (
           <>
             <View style={styles.accountCard}>
-              <AccountSubHeader eyebrow="Historial" title="Mis pedidos" />
-              <Text style={styles.accountHint}>Tus pedidos recientes quedan guardados para rastrear, repetir o revisar el total.</Text>
+
+              <Text style={styles.accountHint}>Revisa tus pedidos y abre el seguimiento de los que están en curso.</Text>
               <View style={styles.accountFilterRow}>
                 <OrderFilterChip active={orderFilter === "all"} label="Ultimos" onPress={() => setOrderFilter("all")} />
                 <OrderFilterChip active={orderFilter === "delivery"} label="Delivery" onPress={() => setOrderFilter("delivery")} />
@@ -4163,7 +4190,7 @@ function AccountScreen({
         ) : panelView === "favorites" ? (
           <>
             <View style={styles.accountCard}>
-              <AccountSubHeader eyebrow="Favoritos" title="Mis favoritos" />
+
               <Text style={styles.accountHint}>Tus locales y platos guardados quedan disponibles aqui para volver a ellos rapidamente.</Text>
               <View style={styles.accountFilterRow}>
                 <OrderFilterChip active={favoriteFilter === "all"} label="Todos" onPress={() => setFavoriteFilter("all")} />
@@ -4173,7 +4200,7 @@ function AccountScreen({
             </View>
             <View style={styles.accountCard}>
               {visibleFavorites.length ? visibleFavorites.map((favorite) => (
-                <Pressable key={favorite.id} onPress={() => onOpenRestaurant(favorite.restaurantSlug)} style={({ pressed }) => [styles.favoriteRow, pressed && styles.pressedCard]}>
+                <Pressable key={favorite.id} onPress={() => onOpenFavorite(favorite)} style={({ pressed }) => [styles.favoriteRow, pressed && styles.pressedCard]}>
                   <Image source={displayImageSource(favorite.imageUrl)} style={styles.favoriteImage} />
                   <View style={styles.favoriteRowBody}>
                     <Text style={styles.favoriteKind}>{favorite.kind === "restaurant" ? "Local" : "Plato"}</Text>
@@ -4187,54 +4214,122 @@ function AccountScreen({
               )}
             </View>
           </>
+        ) : panelView === "settings" ? (
+          <>
+            <View style={styles.accountCard}>
+              <Text style={styles.accountSectionLabel}>PERMISOS DEL TELÉFONO</Text>
+              <AccountMenuRow icon={<BellRing color={colors.blue} size={21} />} meta={notificationSaving ? "Activando…" : notificationMeta} onPress={notificationSaving ? undefined : notificationStatus === "ready" ? () => { void Linking.openSettings().catch(() => setErrorMessage("Abre Ajustes del teléfono y busca Yopido.")); } : enableNotificationsFromAccount} title="Notificaciones de pedidos" />
+              <AccountMenuRow icon={<MapPinned color={colors.blue} size={21} />} meta={locationPermission} onPress={enableLocation} title="Ubicación y mapas" />
+              <AccountMenuRow icon={<Settings color={colors.blue} size={21} />} meta="Cambiar o desactivar permisos" onPress={() => { void Linking.openSettings().catch(() => setErrorMessage("Abre Ajustes del teléfono y busca Yopido.")); }} title="Ajustes del sistema" />
+              <Text style={styles.accountHint}>Tu ubicación ayuda a encontrar locales y marcar una dirección. Puedes elegir el punto en el mapa sin usar el GPS. El seguimiento usa la ubicación del rider y la dirección de tu pedido.</Text>
+              {errorMessage ? <Text style={styles.submitError}>{errorMessage}</Text> : null}
+              {successMessage ? <Text style={styles.successInline}>{successMessage}</Text> : null}
+            </View>
+            <View style={styles.accountCard}>
+              <Text style={styles.accountSectionLabel}>TU CUENTA</Text>
+              <AccountMenuRow icon={<UserRound color={colors.blue} size={21} />} meta="Nombre y datos de contacto" onPress={openProfileEditor} title="Editar mis datos" />
+              <AccountMenuRow icon={<LogOut color={colors.blue} size={21} />} meta="Salir de este teléfono" onPress={signOut} title="Cerrar sesión" />
+              <Pressable onPress={() => { setErrorMessage(""); setDeleteConfirmation(""); setDeleteAccountOpen(true); }} style={styles.addressTextButton}>
+                <Trash2 color={colors.danger} size={18} /><Text style={styles.logoutText}>Eliminar mi cuenta</Text>
+              </Pressable>
+            </View>
+          </>
         ) : panelView === "help" ? (
           <View style={styles.accountCard}>
-            <AccountSubHeader eyebrow="Ayuda" title="Soporte" />
-            <AccountMenuRow icon={<BellRing color={colors.blue} size={19} strokeWidth={3} />} meta={notificationSaving ? "Activando..." : notificationMeta} onPress={notificationSaving ? undefined : enableNotificationsFromAccount} title={notificationStatus === "ready" ? "Notificaciones activas" : "Activar notificaciones"} />
-            <AccountMenuRow icon={<Bell color={colors.blue} size={19} strokeWidth={3} />} meta={notificationTesting ? "Enviando prueba..." : "Envia una prueba en este telefono"} onPress={notificationTesting ? undefined : testNotificationsFromAccount} title="Probar notificacion" />
-            <AccountMenuRow icon={<MessageCircle color={colors.blue} size={19} strokeWidth={3} />} meta="Escribenos para revisar pedidos o datos de tu cuenta" onPress={() => Linking.openURL("https://yopido.shop").catch(() => undefined)} title="Contactar soporte" />
-            {errorMessage ? <Text style={styles.submitError}>{errorMessage}</Text> : null}
-            {successMessage ? <Text style={styles.successInline}>{successMessage}</Text> : null}
-            <Text style={styles.accountHint}>Tambien puedes contactarnos desde el seguimiento de cada pedido cuando necesites hablar con el restaurante.</Text>
+            <Text style={styles.accountName}>Ayuda con tu pedido</Text>
+            <Text style={styles.accountHint}>Abre el pedido para consultar su estado y contactar al restaurante que lo está atendiendo.</Text>
+            <PrimaryButton onPress={() => setPanelView("orders")} text="Ver mis pedidos" />
+            <AccountMenuRow icon={<Settings color={colors.blue} size={20} />} title="Permisos y cuenta" meta="Notificaciones, ubicación y tus datos" onPress={() => setPanelView("settings")} />
           </View>
         ) : (
           <>
-            <View style={styles.accountCard}>
+            <View style={styles.accountProfileHeader}>
               <View style={styles.accountIdentityRow}>
                 <View style={styles.accountAvatar}>
                   <Text style={styles.accountAvatarText}>{(greetingName || "Y").slice(0, 1).toUpperCase()}</Text>
                 </View>
                 <View style={styles.recentOrderBody}>
-                  <Text style={styles.accountName}>{name.trim() || "Cliente Yopido"}</Text>
+                  <Text style={styles.accountHello}>Hola,</Text>
+                  <Text style={styles.accountProfileName}>{name.trim() || greetingName || "Cliente Yopido"}</Text>
+                  <View style={styles.accountCustomerBadge}>
+                    <Text style={styles.accountCustomerBadgeText}>Cliente Yopido</Text>
+                  </View>
                   <Text numberOfLines={1} style={styles.accountEmail}>{sessionUser.email}</Text>
                 </View>
-                <Pressable onPress={openProfileEditor} style={({ pressed }) => [styles.accountEditButton, pressed && styles.pressedCard]}>
-                  <UserRound color={colors.blue} size={17} strokeWidth={3} />
-                  <Text style={styles.accountEditText}>{profileComplete ? "Editar datos" : "Completar"}</Text>
+                <Pressable accessibilityLabel="Editar mis datos" onPress={openProfileEditor} style={({ pressed }) => [styles.accountHeaderButton, pressed && styles.pressedCard]}>
+                  <Pencil color={colors.blue} size={18} />
                 </Pressable>
               </View>
-              <Text style={profileComplete ? styles.accountProfileSummary : styles.accountProfileMissing}>
-                {profileComplete ? `${phone.trim()} | CI ${documentNumber.trim()}` : "Completa tu telefono y carnet para comprar mas rapido."}
-              </Text>
               {successMessage ? <Text style={styles.successInline}>{successMessage}</Text> : null}
             </View>
 
-            <View style={styles.accountCard}>
-              <SectionTitle eyebrow="Panel" title="Mi Yopido" />
-              <AccountMenuRow icon={<MapPin color={colors.blue} size={19} strokeWidth={3} />} meta={addressCount ? `${addressCount} direcciones guardadas` : "Guarda casa, trabajo o favoritos"} onPress={() => setPanelView("addresses")} title="Mis direcciones" />
-              <AccountMenuRow icon={<ReceiptText color={colors.blue} size={19} strokeWidth={3} />} meta={orderCount ? `${orderCount} pedidos recientes` : "Historial y seguimiento"} onPress={() => setPanelView("orders")} title="Mis pedidos" />
-              <AccountMenuRow icon={<BellRing color={colors.blue} size={19} strokeWidth={3} />} meta={notificationSaving ? "Activando..." : notificationMeta} onPress={notificationSaving ? undefined : enableNotificationsFromAccount} title="Notificaciones de pedidos" />
-              <AccountMenuRow icon={<Heart color={colors.blue} size={19} strokeWidth={3} />} meta={favoriteCount ? `${favoriteCount} favoritos guardados` : "Guarda locales y platos"} onPress={() => setPanelView("favorites")} title="Mis favoritos" />
-              <AccountMenuRow icon={<MessageCircle color={colors.blue} size={19} strokeWidth={3} />} meta="Ayuda con pedidos o cuenta" onPress={() => setPanelView("help")} title="Ayuda y soporte" />
-            </View>
+            {!profileComplete ? (
+              <Pressable onPress={openProfileEditor} style={({ pressed }) => [styles.accountProfileCompletion, pressed && styles.pressedCard]}>
+                <View style={styles.accountProfileCompletionIcon}><UserRound color={colors.blue} size={20} /></View>
+                <View style={styles.recentOrderBody}>
+                  <Text style={styles.accountProfileCompletionTitle}>Completa tu perfil</Text>
+                  <Text style={styles.accountProfileCompletionCopy}>Agrega tu teléfono y carnet para comprar más rápido.</Text>
+                </View>
+                <ArrowRight color={colors.blue} size={18} strokeWidth={3} />
+              </Pressable>
+            ) : null}
 
-            <Pressable onPress={signOut} style={({ pressed }) => [styles.accountLogoutButton, pressed && styles.pressedCard]}>
-              <LogOut color={colors.danger} size={17} strokeWidth={3} />
-              <Text style={styles.logoutText}>Cerrar sesion</Text>
-            </Pressable>
+            <AccountActiveOrders orders={customerStore.recentOrders} onOpen={onOpenRecentOrder} />
+            <View style={styles.accountHomeSectionHeader}>
+              <Text style={styles.accountHomeSectionTitle}>Todo en un solo lugar</Text>
+              <Text style={styles.accountHomeSectionCopy}>Tus pedidos, lugares y favoritos</Text>
+            </View>
+            <View style={styles.accountShortcutGrid}>
+              <AccountShortcut icon={<ReceiptText color={colors.blue} size={25} />} title="Mis pedidos" meta={orderCount ? `${orderCount} recientes` : "Historial y seguimiento"} onPress={() => setPanelView("orders")} />
+              <AccountShortcut icon={<MapPin color={colors.blue} size={25} />} title="Direcciones" meta={addressCount ? `${addressCount} guardadas` : "Agrega tu primer lugar"} onPress={() => setPanelView("addresses")} />
+              <AccountShortcut icon={<Heart color={colors.blue} size={25} />} title="Favoritos" meta={favoriteCount ? `${favoriteCount} guardados` : "Locales y platos"} onPress={() => setPanelView("favorites")} />
+              <AccountShortcut icon={<Settings color={colors.blue} size={25} />} title="Configuración" meta="Permisos y cuenta" onPress={() => setPanelView("settings")} />
+            </View>
+            {customerStore.favorites.length ? (
+              <View style={styles.accountCard}>
+                <View style={styles.accountSectionActionRow}>
+                  <Text style={styles.accountName}>Tus favoritos</Text>
+                  <Pressable onPress={() => setPanelView("favorites")} style={styles.addressTextButton}><Text style={styles.accountSmallActionText}>Ver todos</Text></Pressable>
+                </View>
+                {customerStore.favorites.slice(0, 2).map((favorite) => (
+                  <Pressable key={favorite.id} onPress={() => onOpenFavorite(favorite)} style={styles.favoriteRow}>
+                    <Image source={displayImageSource(favorite.imageUrl)} style={styles.favoriteImage} />
+                    <View style={styles.recentOrderBody}><Text numberOfLines={1} style={styles.favoriteTitle}>{favorite.title}</Text><Text numberOfLines={1} style={styles.favoriteSubtitle}>{favorite.subtitle}</Text></View>
+                    <ArrowRight color={colors.blue} size={20} />
+                  </Pressable>
+                ))}
+              </View>
+            ) : null}
+            <AccountMenuRow icon={<MessageCircle color={colors.blue} size={21} />} meta="Consulta el estado y contacta al local" onPress={() => setPanelView("help")} title="Ayuda con un pedido" />
           </>
         )}
       </ScrollView>
+      <Modal transparent animationType="slide" visible={Boolean(addressToDelete)} onRequestClose={() => { if (!addressSaving) setAddressToDelete(null); }}>
+        <View style={styles.profileEditorOverlay}>
+          <View style={styles.profileEditorBackdrop} />
+          <SafeAreaView edges={["bottom"]} style={styles.profileEditorSheet}>
+            <Text style={styles.accountTopTitle}>Eliminar {addressToDelete?.label}</Text>
+            <Text style={styles.accountHint}>Los pedidos ya realizados conservarán su dirección de entrega.</Text>
+            {errorMessage ? <Text style={styles.submitError}>{errorMessage}</Text> : null}
+            <PrimaryButton loading={addressSaving} disabled={addressSaving} onPress={() => { if (addressToDelete) void changeAddress(addressToDelete, "delete"); }} text="Eliminar dirección" />
+            <Pressable disabled={addressSaving} onPress={() => setAddressToDelete(null)} style={styles.profileCancelButton}><Text style={styles.profileCancelText}>Cancelar</Text></Pressable>
+          </SafeAreaView>
+        </View>
+      </Modal>
+      <Modal transparent animationType="slide" visible={deleteAccountOpen} onRequestClose={() => { if (!deletingAccount) setDeleteAccountOpen(false); }}>
+        <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} style={styles.profileEditorOverlay}>
+          <View style={styles.profileEditorBackdrop} />
+          <SafeAreaView edges={["bottom"]} style={styles.profileEditorSheet}>
+            <Text style={styles.accountTopTitle}>Eliminar mi cuenta</Text>
+            <Text style={styles.accountHint}>Se eliminarán tu acceso, perfil, direcciones y favoritos. Los pedidos realizados conservarán sus datos de compra en el restaurante. Esta acción no se puede deshacer.</Text>
+            <Text style={styles.accountAddressText}>Escribe ELIMINAR para confirmar.</Text>
+            <InputBox value={deleteConfirmation} onChangeText={setDeleteConfirmation} placeholder="ELIMINAR" autoCapitalize="characters" />
+            {errorMessage ? <Text style={styles.submitError}>{errorMessage}</Text> : null}
+            <PrimaryButton loading={deletingAccount} disabled={deletingAccount || deleteConfirmation !== "ELIMINAR"} onPress={removeAccount} text="Eliminar definitivamente" />
+            <Pressable disabled={deletingAccount} onPress={() => setDeleteAccountOpen(false)} style={styles.profileCancelButton}><Text style={styles.profileCancelText}>Conservar mi cuenta</Text></Pressable>
+          </SafeAreaView>
+        </KeyboardAvoidingView>
+      </Modal>
       <Modal animationType="slide" onRequestClose={closeProfileEditor} transparent visible={profileEditorOpen}>
         <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} style={styles.profileEditorOverlay}>
           <Pressable onPress={closeProfileEditor} style={styles.profileEditorBackdrop} />
@@ -4273,8 +4368,10 @@ function AccountScreen({
       {addressPickerOpen ? (
         <MapPickerModal
           collectAddressDetails
-          initialLocation={null}
-          onClose={() => setAddressPickerOpen(false)}
+          initialDetails={editingAddress ? { label: editingAddress.label, apartment: editingAddress.apartment ?? "", buildingName: editingAddress.buildingName ?? "", reference: editingAddress.reference ?? "" } : undefined}
+          errorMessage={errorMessage}
+          initialLocation={editingAddress && typeof editingAddress.latitude === "number" && typeof editingAddress.longitude === "number" ? { latitude: editingAddress.latitude, longitude: editingAddress.longitude, mapsUrl: editingAddress.mapsUrl ?? "", label: editingAddress.address } : null}
+          onClose={() => { if (!addressSaving) setAddressPickerOpen(false); }}
           onConfirm={saveAddressFromMap}
           saving={addressSaving}
         />
@@ -4283,27 +4380,93 @@ function AccountScreen({
   );
 }
 
+function AccountShortcut({ icon, title, meta, onPress }: { icon: ReactNode; title: string; meta: string; onPress: () => void }) {
+  return <Pressable accessibilityRole="button" onPress={onPress} style={({ pressed }) => [styles.accountShortcut, pressed && styles.pressedCard]}>
+    <View style={styles.accountShortcutIcon}>{icon}</View>
+    <Text style={styles.accountMenuTitle}>{title}</Text>
+    <Text style={styles.accountMenuMeta}>{meta}</Text>
+  </Pressable>;
+}
+
+function AccountActiveOrders({ orders, onOpen }: { orders: RecentOrder[]; onOpen: (order: RecentOrder) => void }) {
+  const focused = useIsFocused();
+  const [live, setLive] = useState<MobileTrackingResult[]>([]);
+  const [stale, setStale] = useState(false);
+  const candidates = orders.filter((order) => order.status !== "delivered" && order.status !== "cancelled" && order.trackingToken);
+  const candidateKey = candidates.map((order) => `${order.id}:${order.trackingToken}`).join("|");
+  useEffect(() => {
+    if (!focused) return;
+    let disposed = false;
+    let busy = false;
+    async function refresh() {
+      if (busy || AppState.currentState !== "active") return;
+      busy = true;
+      const results = await Promise.allSettled(candidates.map((order) => getMobileOrderStatus({ orderId: order.id, trackingToken: order.trackingToken! })));
+      if (!disposed) {
+        setStale(results.some((result) => result.status === "rejected"));
+        setLive((previous) => results.flatMap((result, index) => {
+          if (result.status === "fulfilled") return isTerminalTracking(result.value.order) ? [] : [result.value];
+          return previous.filter((item) => item.order.id === candidates[index].id);
+        }));
+      }
+      busy = false;
+    }
+    void refresh();
+    const timer = setInterval(() => void refresh(), 30000);
+    return () => { disposed = true; clearInterval(timer); };
+  }, [focused, candidateKey]);
+  if (!live.length) return null;
+  return <View style={styles.activeOrderCard}>
+    <View style={styles.accountSectionActionRow}><Text style={styles.activeOrderEyebrow}>PEDIDOS EN CURSO</Text><Bike color={colors.green} size={22} /></View>
+    {live.map((tracking) => {
+      const activeStage = tracking.order.status === "delivered" || tracking.order.deliveryDispatch?.status === "delivered"
+        ? 3
+        : tracking.order.deliveryDispatch?.status === "active" || tracking.order.deliveryDispatch?.status === "arrived"
+          ? 2
+          : tracking.order.status === "preparing" || tracking.order.status === "ready"
+            ? 1
+            : 0;
+      const progressWidths = ["0%", "33%", "66%", "100%"] as const;
+      return <Pressable key={tracking.order.id} accessibilityRole="button" onPress={() => {
+        const order = orders.find((item) => item.id === tracking.order.id); if (order) onOpen(order);
+      }} style={styles.activeOrderEntry}>
+        <View style={styles.activeOrderRow}>
+          <View style={styles.recentOrderBody}>
+            <Text style={styles.activeOrderName}>{tracking.restaurant.name}</Text>
+            <Text style={styles.activeOrderState}>{trackingLabel(tracking.order)}</Text>
+            <Text style={styles.activeOrderNumber}>{tracking.order.orderNumber} · {formatBs(tracking.order.total)}</Text>
+          </View><ArrowRight color={colors.green} size={22} />
+        </View>
+        <View style={styles.activeOrderProgress}>
+          <View style={styles.activeOrderProgressTrack} />
+          <View style={[styles.activeOrderProgressFill, { width: progressWidths[activeStage] }]} />
+          <View style={styles.activeOrderProgressDots}>
+            {["Confirmado", "Preparando", "En camino", "Entregado"].map((label, index) => (
+              <View key={label} style={styles.activeOrderProgressStep}>
+                <View style={[styles.activeOrderProgressDot, index <= activeStage && styles.activeOrderProgressDotActive]}>
+                  {index < activeStage ? <Check color={colors.blue} size={10} strokeWidth={4} /> : null}
+                </View>
+                <Text numberOfLines={1} style={[styles.activeOrderProgressLabel, index <= activeStage && styles.activeOrderProgressLabelActive]}>{label}</Text>
+              </View>
+            ))}
+          </View>
+        </View>
+      </Pressable>;
+    })}
+    {stale ? <Text style={styles.activeOrderNumber}>Sin conexión reciente. Abre el pedido para actualizar.</Text> : null}
+  </View>;
+}
+
 function AccountMenuRow({ icon, title, meta, onPress }: { icon: ReactNode; title: string; meta: string; onPress?: () => void }) {
   return (
     <Pressable onPress={onPress} style={({ pressed }) => [styles.accountMenuRow, pressed && onPress && styles.pressedCard]}>
       <View style={styles.accountRowIcon}>{icon}</View>
       <View style={styles.recentOrderBody}>
         <Text style={styles.accountMenuTitle}>{title}</Text>
-        <Text numberOfLines={1} style={styles.accountMenuMeta}>{meta}</Text>
+        <Text numberOfLines={2} style={styles.accountMenuMeta}>{meta}</Text>
       </View>
       <ArrowRight color={colors.blue} size={18} strokeWidth={3} />
     </Pressable>
-  );
-}
-
-function AccountSubHeader({ eyebrow, title }: { eyebrow: string; title: string }) {
-  return (
-    <View style={styles.accountSubHeader}>
-      <View style={styles.recentOrderBody}>
-        <Text style={styles.eyebrow}>{eyebrow}</Text>
-        <Text style={styles.title}>{title}</Text>
-      </View>
-    </View>
   );
 }
 
@@ -4316,6 +4479,8 @@ function OrderFilterChip({ active, label, onPress }: { active: boolean; label: s
 }
 
 function BottomNav({ active, onNavigate }: { active: "home" | "orders" | "promos" | "account"; onNavigate: (name: "home" | "promos" | "account") => void }) {
+  const insets = useSafeAreaInsets();
+  const bottom = Math.max(insets.bottom, 8) + 8;
   const items = [
     { key: "home" as const, label: "Inicio", icon: Home },
     { key: "promos" as const, label: "Promos", icon: Flame },
@@ -4327,7 +4492,7 @@ function BottomNav({ active, onNavigate }: { active: "home" | "orders" | "promos
     const Icon = item.icon;
     const selected = active === item.key;
     return (
-      <Pressable key={item.key} onPress={() => onNavigate(item.key)} style={({ pressed }) => [styles.bottomNavItem, Platform.OS === "ios" && styles.bottomNavItemIos, selected && styles.bottomNavItemActive, pressed && styles.bottomNavItemPressed]}>
+      <Pressable accessibilityRole="tab" accessibilityState={{ selected }} key={item.key} onPress={() => onNavigate(item.key)} style={({ pressed }) => [styles.bottomNavItem, Platform.OS === "ios" && styles.bottomNavItemIos, selected && styles.bottomNavItemActive, pressed && styles.bottomNavItemPressed]}>
         <Icon color={selected ? colors.blue : Platform.OS === "ios" ? "#31516F" : colors.muted} size={Platform.OS === "ios" ? 20 : 19} strokeWidth={3} />
         <Text style={[styles.bottomNavText, Platform.OS === "ios" && styles.bottomNavTextIos, selected && styles.bottomNavTextActive]}>{item.label}</Text>
       </Pressable>
@@ -4336,7 +4501,7 @@ function BottomNav({ active, onNavigate }: { active: "home" | "orders" | "promos
 
   if (useLiquidGlass) {
     return (
-      <GlassContainer spacing={14} style={styles.bottomNavGlassContainer}>
+      <GlassContainer spacing={14} style={[styles.bottomNavGlassContainer, { bottom }]}>
         <GlassView
           colorScheme="light"
           glassEffectStyle={{ animate: true, animationDuration: 0.28, style: "regular" }}
@@ -4356,7 +4521,7 @@ function BottomNav({ active, onNavigate }: { active: "home" | "orders" | "promos
             style={[styles.bottomNavGlassItem, selected && styles.bottomNavGlassItemSelected]}
             tintColor={selected ? "rgba(183,255,0,0.36)" : "rgba(255,255,255,0.08)"}
           >
-            <Pressable onPress={() => onNavigate(item.key)} style={({ pressed }) => [styles.bottomNavGlassPressable, pressed && styles.bottomNavItemPressed]}>
+            <Pressable accessibilityRole="tab" accessibilityState={{ selected }} onPress={() => onNavigate(item.key)} style={({ pressed }) => [styles.bottomNavGlassPressable, pressed && styles.bottomNavItemPressed]}>
               <Icon color={selected ? colors.blue : "#254765"} size={21} strokeWidth={selected ? 3.2 : 2.7} />
               <Text style={[styles.bottomNavGlassText, selected && styles.bottomNavGlassTextActive]}>{item.label}</Text>
             </Pressable>
@@ -4367,7 +4532,7 @@ function BottomNav({ active, onNavigate }: { active: "home" | "orders" | "promos
     );
   }
 
-  return <View style={[styles.bottomNav, Platform.OS === "ios" && styles.bottomNavIosFallback]}>{fallbackContent}</View>;
+  return <View style={[styles.bottomNav, Platform.OS === "ios" && styles.bottomNavIosFallback, { bottom }]}>{fallbackContent}</View>;
 }
 
 function HomeFooter({
@@ -5837,6 +6002,8 @@ function ReviewLine({ label, value }: { label: string; value: string }) {
 
 function MapPickerModal({
   initialLocation,
+  initialDetails,
+  errorMessage,
   restaurant,
   collectAddressDetails = false,
   onClose,
@@ -5844,6 +6011,8 @@ function MapPickerModal({
   saving = false,
 }: {
   initialLocation: DeliveryLocation | null;
+  initialDetails?: AddressDetails;
+  errorMessage?: string;
   restaurant?: RestaurantSummary;
   collectAddressDetails?: boolean;
   onClose: () => void;
@@ -5864,10 +6033,10 @@ function MapPickerModal({
     longitudeDelta: 0.012,
   });
   const [locating, setLocating] = useState(false);
-  const [label, setLabel] = useState("");
-  const [apartment, setApartment] = useState("");
-  const [reference, setReference] = useState("");
-  const [buildingName, setBuildingName] = useState("");
+  const [label, setLabel] = useState(initialDetails?.label ?? "");
+  const [apartment, setApartment] = useState(initialDetails?.apartment ?? "");
+  const [reference, setReference] = useState(initialDetails?.reference ?? "");
+  const [buildingName, setBuildingName] = useState(initialDetails?.buildingName ?? "");
   const [formError, setFormError] = useState("");
   const [mapTouching, setMapTouching] = useState(false);
 
@@ -5962,7 +6131,7 @@ function MapPickerModal({
     const geocode = await Location.reverseGeocodeAsync({ latitude, longitude }).catch(() => []);
     const place = geocode[0];
     const locationLabel = [place?.street, place?.streetNumber, place?.district, place?.city].filter(Boolean).join(", ") || "Punto marcado en el mapa";
-    await onConfirm({ latitude, longitude, mapsUrl, label: locationLabel }, cleanDetails);
+    await onConfirm({ latitude, longitude, mapsUrl, label: initialLocation && initialLocation.latitude === latitude && initialLocation.longitude === longitude ? initialLocation.label : locationLabel }, cleanDetails);
   }
 
   let NativeMapView: any = null;
@@ -5995,7 +6164,7 @@ function MapPickerModal({
           <View style={styles.mapPickerHeader}>
             <View>
               <Text style={styles.cartSheetEyebrow}>Entrega</Text>
-              <Text style={styles.mapPickerTitle}>{collectAddressDetails ? "Nueva direccion" : "Marca tu punto"}</Text>
+              <Text style={styles.mapPickerTitle}>{collectAddressDetails ? (initialDetails ? "Editar dirección" : "Nueva dirección") : "Marca tu punto"}</Text>
             </View>
             <IconButton light onPress={onClose}><X color={colors.blue} size={22} strokeWidth={3} /></IconButton>
           </View>
@@ -6003,6 +6172,7 @@ function MapPickerModal({
             <View style={[styles.mapPickerCanvas, Platform.OS !== "android" && styles.mapPickerCanvasClipped, { height: mapHeight }]}>
               {useWebMap ? (
                 <WebView
+          applicationNameForUserAgent="YopidoMobile/1.1 (+https://yopido.shop)"
                   ref={webMapRef}
                   allowsInlineMediaPlayback
                   domStorageEnabled
@@ -6092,7 +6262,7 @@ function MapPickerModal({
                   <Text style={styles.addressFieldLabel}>Referencia</Text>
                   <InputBox multiline onChangeText={setReference} placeholder="Porton, color de puerta o indicacion para llegar" value={reference} />
                 </View>
-                {formError ? <Text style={styles.submitError}>{formError}</Text> : null}
+                {formError || errorMessage ? <Text style={styles.submitError}>{formError || errorMessage}</Text> : null}
               </View>
             ) : null}
 
@@ -6402,7 +6572,7 @@ function InputBox({
   multiline?: boolean;
   keyboardType?: "phone-pad" | "email-address" | "number-pad";
   secureTextEntry?: boolean;
-  autoCapitalize?: "none" | "sentences";
+  autoCapitalize?: "none" | "sentences" | "characters";
 }) {
   return (
     <TextInput
@@ -6465,19 +6635,62 @@ const styles = StyleSheet.create({
   addButtonDisabled: { backgroundColor: "#D8E4E9", shadowOpacity: 0 },
   accountAddButton: { alignItems: "center", backgroundColor: colors.green, borderRadius: 999, elevation: 4, flexShrink: 0, height: 44, justifyContent: "center", shadowColor: colors.green, shadowOpacity: 0.25, shadowRadius: 10, width: 44 },
   accountAddButtonDisabled: { opacity: 0.45 },
-  accountAvatar: { alignItems: "center", backgroundColor: colors.green, borderRadius: 999, height: 48, justifyContent: "center", width: 48 },
-  accountAvatarText: { color: colors.blue, fontSize: 20, fontWeight: "900" },
+  accountAvatar: { alignItems: "center", backgroundColor: colors.green, borderRadius: 999, height: 62, justifyContent: "center", width: 62 },
+  accountAvatarText: { color: colors.blue, fontSize: 25, fontWeight: "900" },
+  accountSafe: { flex: 1, backgroundColor: "#F7F9FC" },
+  accountTopBar: { flexDirection: "row", alignItems: "center", gap: 12, paddingVertical: 14 },
+  accountTopBarHome: { minHeight: 62, paddingBottom: 6 },
+  accountHeaderButton: { minHeight: 44, minWidth: 44, alignItems: "center", justifyContent: "center", borderRadius: 22, backgroundColor: "#EEF3F8" },
+  accountTopEyebrow: { color: colors.blue, fontSize: 19, fontWeight: "900", letterSpacing: -0.8 },
+  accountTopTitle: { color: colors.blue, fontSize: 27, fontWeight: "800", marginTop: 4 },
+  accountSectionLabel: { color: colors.muted, fontSize: 11, fontWeight: "700", letterSpacing: 1.2, marginBottom: 6 },
+  accountShortcutGrid: { flexDirection: "row", flexWrap: "wrap", gap: 12 },
+  accountShortcut: { width: "48%", flexGrow: 1, padding: 14, minHeight: 116, borderRadius: 20, borderWidth: 1, borderColor: colors.border, backgroundColor: "#FFFFFF", gap: 2, shadowColor: colors.blue, shadowOpacity: 0.05, shadowRadius: 10 },
+  accountShortcutIcon: { width: 40, height: 40, borderRadius: 14, backgroundColor: colors.softBlue, alignItems: "center", justifyContent: "center", marginBottom: 7 },
+  accountDefaultLabel: { color: "#426300", fontWeight: "600", fontSize: 12, marginTop: 4 },
+  accountAddressText: { color: colors.blue, fontSize: 15, lineHeight: 22 },
+  savedAddressCard: { borderRadius: 20, backgroundColor: "#F5F8FC", borderWidth: 1, borderColor: colors.border, padding: 16, gap: 9 },
+  addressActions: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", borderTopWidth: 1, borderTopColor: colors.border, paddingTop: 8, marginTop: 4 },
+  addressTextButton: { minHeight: 44, flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 6 },
+  activeOrderCard: { padding: 18, borderRadius: 24, backgroundColor: colors.blue, gap: 10, shadowColor: colors.blue, shadowOpacity: 0.18, shadowRadius: 16 },
+  activeOrderEntry: { gap: 12 },
+  activeOrderEyebrow: { color: colors.green, fontSize: 12, fontWeight: "800", letterSpacing: 1 },
+  activeOrderRow: { flexDirection: "row", alignItems: "center", gap: 12, paddingVertical: 6 },
+  activeOrderName: { color: "#FFFFFF", fontSize: 21, fontWeight: "800" },
+  activeOrderState: { color: "#FFFFFF", fontSize: 14, marginTop: 6, lineHeight: 20 },
+  activeOrderNumber: { color: "#CAD8E8", fontSize: 12, marginTop: 8 },
+  activeOrderProgress: { height: 48, justifyContent: "flex-start", marginHorizontal: 2, position: "relative" },
+  activeOrderProgressTrack: { backgroundColor: "rgba(255,255,255,0.25)", height: 4, left: "6%", position: "absolute", right: "6%", top: 6 },
+  activeOrderProgressFill: { backgroundColor: colors.green, height: 4, left: "6%", maxWidth: "88%", position: "absolute", top: 6 },
+  activeOrderProgressDots: { flexDirection: "row", justifyContent: "space-between", position: "absolute", left: 0, right: 0, top: 0 },
+  activeOrderProgressStep: { alignItems: "center", gap: 5, width: "25%" },
+  activeOrderProgressDot: { alignItems: "center", backgroundColor: "#7790A9", borderColor: colors.blue, borderRadius: 999, borderWidth: 2, height: 16, justifyContent: "center", width: 16 },
+  activeOrderProgressDotActive: { backgroundColor: colors.green },
+  activeOrderProgressLabel: { color: "#AFC1D2", fontSize: 9, fontWeight: "700" },
+  activeOrderProgressLabelActive: { color: "#FFFFFF" },
   accountCard: { backgroundColor: "#FFFFFF", borderColor: colors.border, borderRadius: 22, borderWidth: 1, gap: 10, padding: 14, shadowColor: colors.blue, shadowOpacity: 0.08, shadowRadius: 12 },
   accountEditButton: { alignItems: "center", backgroundColor: colors.softBlue, borderColor: colors.border, borderRadius: 999, borderWidth: 1, flexDirection: "row", flexShrink: 0, gap: 7, minHeight: 42, paddingHorizontal: 13 },
   accountEditText: { color: colors.blue, fontSize: 13, fontWeight: "900" },
   accountEmail: { color: colors.muted, fontSize: 12, fontWeight: "800", marginTop: 2 },
+  accountHello: { color: colors.muted, fontSize: 12, fontWeight: "700" },
+  accountProfileName: { color: colors.ink, fontSize: 21, fontWeight: "900", lineHeight: 25 },
+  accountCustomerBadge: { alignSelf: "flex-start", backgroundColor: colors.blue, borderRadius: 999, marginTop: 5, paddingHorizontal: 9, paddingVertical: 4 },
+  accountCustomerBadgeText: { color: "#FFFFFF", fontSize: 10, fontWeight: "900" },
+  accountProfileHeader: { gap: 8, paddingHorizontal: 3, paddingVertical: 8 },
+  accountProfileCompletion: { alignItems: "center", backgroundColor: "#EEF5FB", borderColor: "#D8E4EF", borderRadius: 18, borderWidth: 1, flexDirection: "row", gap: 10, padding: 12 },
+  accountProfileCompletionIcon: { alignItems: "center", backgroundColor: "#FFFFFF", borderRadius: 13, height: 40, justifyContent: "center", width: 40 },
+  accountProfileCompletionTitle: { color: colors.blue, fontSize: 14, fontWeight: "900" },
+  accountProfileCompletionCopy: { color: colors.muted, fontSize: 11, lineHeight: 16, marginTop: 2 },
+  accountHomeSectionHeader: { paddingHorizontal: 2, paddingTop: 4 },
+  accountHomeSectionTitle: { color: colors.ink, fontSize: 17, fontWeight: "900" },
+  accountHomeSectionCopy: { color: colors.muted, fontSize: 12, marginTop: 2 },
   accountFilterChip: { alignItems: "center", backgroundColor: colors.background, borderColor: colors.border, borderRadius: 999, borderWidth: 1, flex: 1, justifyContent: "center", minHeight: 42, paddingHorizontal: 12 },
   accountFilterChipActive: { backgroundColor: colors.green, borderColor: colors.green },
   accountFilterRow: { flexDirection: "row", gap: 8, marginTop: 4 },
   accountFilterText: { color: colors.muted, fontSize: 12, fontWeight: "900" },
   accountFilterTextActive: { color: colors.blue },
   accountGreeting: { color: "#FFFFFF", fontSize: 27, fontWeight: "900", lineHeight: 31, marginTop: 10 },
-  accountHint: { color: colors.muted, fontSize: 13, fontWeight: "800", lineHeight: 19 },
+  accountHint: { color: colors.muted, fontSize: 13, fontWeight: "400", lineHeight: 20 },
   accountHero: { backgroundColor: colors.blue, borderBottomLeftRadius: 30, borderBottomRightRadius: 30, gap: 2, marginHorizontal: -14, padding: 18, paddingBottom: 24 },
   accountHeroCopy: { color: "#FFFFFFD1", fontSize: 14, fontWeight: "800", lineHeight: 20, marginTop: 6 },
   accountHeroEyebrow: { color: colors.green, fontSize: 12, fontWeight: "900", letterSpacing: 2.6, marginTop: 18, textTransform: "uppercase" },
@@ -6486,7 +6699,7 @@ const styles = StyleSheet.create({
   accountHeroTop: { alignItems: "center", flexDirection: "row", justifyContent: "space-between" },
   accountIdentityRow: { alignItems: "center", flexDirection: "row", gap: 12, marginBottom: 2 },
   accountLogoutButton: { alignItems: "center", alignSelf: "center", backgroundColor: "#FFF1F3", borderColor: "#FEE4E2", borderRadius: 999, borderWidth: 1, flexDirection: "row", gap: 7, justifyContent: "center", minHeight: 46, paddingHorizontal: 18 },
-  accountMenuMeta: { color: colors.muted, fontSize: 12, fontWeight: "800", marginTop: 2 },
+  accountMenuMeta: { color: colors.muted, fontSize: 12, fontWeight: "400", marginTop: 4, lineHeight: 17 },
   accountMenuRow: { alignItems: "center", backgroundColor: colors.background, borderColor: colors.border, borderRadius: 18, borderWidth: 1, flexDirection: "row", gap: 11, minHeight: 66, padding: 11 },
   accountMenuTitle: { color: colors.ink, fontSize: 15, fontWeight: "900" },
   accountName: { color: colors.ink, fontSize: 18, fontWeight: "900" },
@@ -6497,8 +6710,8 @@ const styles = StyleSheet.create({
   accountOrderStatusText: { color: colors.blue, fontSize: 10, fontWeight: "900" },
   accountOrderStatusTextCancelled: { color: colors.danger },
   accountOrderTrailing: { alignItems: "flex-end", gap: 3, maxWidth: 112 },
-  accountPage: { backgroundColor: colors.blue, flex: 1 },
-  accountPageContent: { backgroundColor: colors.background, minHeight: "100%" },
+  accountPage: { backgroundColor: "#F7F9FC", flex: 1 },
+  accountPageContent: { backgroundColor: "#F7F9FC", minHeight: "100%", paddingHorizontal: 20, paddingBottom: 124 },
   accountProfileMissing: { color: colors.danger, fontSize: 12, fontWeight: "800", lineHeight: 18 },
   accountProfileSummary: { color: colors.muted, fontSize: 12, fontWeight: "800", lineHeight: 18 },
   accountRowIcon: { alignItems: "center", backgroundColor: colors.softBlue, borderRadius: 16, height: 42, justifyContent: "center", width: 42 },
@@ -6942,9 +7155,11 @@ const styles = StyleSheet.create({
   riderLiveIcon: { alignItems: "center", backgroundColor: colors.green, borderRadius: 15, height: 42, justifyContent: "center", width: 42 },
   riderLiveText: { color: colors.muted, fontSize: 12, fontWeight: "800", marginTop: 2 },
   riderLiveTitle: { color: colors.blue, fontSize: 15, fontWeight: "900" },
-  riderMapCanvas: { backgroundColor: colors.softBlue, borderRadius: 20, height: 250, marginTop: 12, overflow: "hidden" },
+  mapUnavailable: { position: "absolute", top: 12, left: 12, right: 12, backgroundColor: "#FFFFFF", padding: 12, borderRadius: 16, zIndex: 2 },
+  mapRecenter: { position: "absolute", right: 12, bottom: 28, width: 44, height: 44, backgroundColor: "#FFFFFF", borderRadius: 22, alignItems: "center", justifyContent: "center", elevation: 2 },
+  riderMapCanvas: { backgroundColor: colors.softBlue, borderRadius: 20, height: 320, marginTop: 12, overflow: "hidden" },
   riderMapCanvasInline: { height: 190 },
-  riderMapEmpty: { alignItems: "center", alignSelf: "center", backgroundColor: "rgba(255,255,255,0.92)", borderRadius: 18, gap: 6, justifyContent: "center", marginTop: 86, minHeight: 78, paddingHorizontal: 16 },
+  riderMapEmpty: { position: "absolute", top: 12, left: 12, right: 12, flexDirection: "row", alignItems: "center", backgroundColor: "rgba(255,255,255,0.92)", borderRadius: 16, gap: 8, padding: 12 },
   riderMapEmptyText: { color: colors.blue, fontSize: 13, fontWeight: "900" },
   riderSheet: { backgroundColor: colors.surface, borderTopLeftRadius: 28, borderTopRightRadius: 28, bottom: 0, left: 0, maxHeight: "88%", padding: 16, position: "absolute", right: 0 },
   riderSheetHeader: { alignItems: "center", flexDirection: "row", justifyContent: "space-between" },
