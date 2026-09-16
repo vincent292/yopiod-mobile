@@ -147,7 +147,7 @@ type DeliveryLocation = { latitude: number; longitude: number; mapsUrl: string; 
 type AddressDetails = { label: string; apartment: string; reference: string; buildingName: string };
 type SessionUser = { id: string; email?: string; accessToken?: string };
 type AccountPanelView = "home" | "addresses" | "orders" | "favorites" | "help" | "settings";
-type OrderHistoryFilter = "all" | "delivery" | "pickup";
+type OrderHistoryFilter = "all" | "active" | "completed";
 type FavoriteFilter = "all" | "restaurant" | "product";
 type NotificationStatus = "checking" | "disabled" | "error" | "ready" | "unknown";
 type GroupOpenTokens = { restaurantSlug?: string; sessionToken?: string; hostAccessToken?: string; participantToken?: string };
@@ -3087,8 +3087,8 @@ function OrdersScreen({
             <ChevronLeft color={colors.blue} size={24} strokeWidth={3} />
           </IconButton>
           <View style={styles.trackingTitleBlock}>
-            <Text style={styles.eyebrow}>Rastreo</Text>
-            <Text style={styles.title}>Sigue tu pedido</Text>
+            <Text style={styles.eyebrow}>{tracking ? `Pedido ${tracking.order.orderNumber}` : "Rastreo"}</Text>
+            <Text style={styles.title}>{tracking ? tracking.order.deliveryDispatch?.status === "active" || tracking.order.deliveryDispatch?.status === "arrived" ? "Tu pedido en camino" : "Detalle del pedido" : "Sigue tu pedido"}</Text>
           </View>
         </View>
 
@@ -3177,6 +3177,12 @@ function recentOrderModeLabel(orderType?: string) {
   if (orderType === "table") return "Mesa";
   if (orderType === "pos") return "Local";
   return "Delivery";
+}
+
+function recentOrderDateLabel(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleString("es-BO", { day: "2-digit", hour: "2-digit", minute: "2-digit", month: "short" });
 }
 
 function orderModeLabel(orderType: MobileOrderType) {
@@ -3792,7 +3798,12 @@ function AccountScreen({
           ? "Toca para permitirlas en este telefono"
           : notificationMessage || "Toca para revisar la configuracion";
   const visibleRecentOrders = useMemo(() => {
-    return customerStore.recentOrders.filter((order) => orderFilter === "all" || order.orderType === orderFilter);
+    return customerStore.recentOrders.filter((order) => {
+      if (orderFilter === "all") return true;
+      const completed = order.status === "delivered" || order.status === "cancelled";
+      if (orderFilter === "completed") return completed;
+      return Boolean(order.status) && !completed;
+    });
   }, [customerStore.recentOrders, orderFilter]);
   const visibleFavorites = useMemo(() => {
     return customerStore.favorites.filter((favorite) => favoriteFilter === "all" || favorite.kind === favoriteFilter);
@@ -4060,9 +4071,24 @@ function AccountScreen({
             {panelView !== "home" ? <Text style={styles.accountTopTitle}>{({ addresses: "Mis direcciones", orders: "Mis pedidos", favorites: "Mis favoritos", settings: "Configuración", help: "Ayuda" })[panelView]}</Text> : null}
           </View>
           {sessionUser && panelView === "home" ? (
-            <Pressable accessibilityRole="button" accessibilityLabel="Configuración" onPress={() => setPanelView("settings")} style={styles.accountHeaderButton}>
-              <Settings color={colors.blue} size={23} />
-            </Pressable>
+            <View style={styles.accountTopActions}>
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel="Notificaciones"
+                disabled={notificationSaving}
+                onPress={() => {
+                  if (notificationStatus === "ready") void Linking.openSettings().catch(() => setErrorMessage("Abre Ajustes del teléfono y busca Yopido."));
+                  else void enableNotificationsFromAccount();
+                }}
+                style={({ pressed }) => [styles.accountHeaderButton, pressed && styles.pressedCard]}
+              >
+                {notificationSaving ? <ActivityIndicator color={colors.blue} size="small" /> : <BellRing color={colors.blue} size={21} />}
+                {notificationStatus === "ready" ? <View style={styles.accountNotificationDot} /> : null}
+              </Pressable>
+              <Pressable accessibilityRole="button" accessibilityLabel="Configuración" onPress={() => setPanelView("settings")} style={styles.accountHeaderButton}>
+                <Settings color={colors.blue} size={23} />
+              </Pressable>
+            </View>
           ) : null}
         </View>
 
@@ -4114,7 +4140,7 @@ function AccountScreen({
                   <Plus color={colors.blue} size={23} strokeWidth={3.5} />
                 </Pressable>
               </View>
-              <Text style={styles.accountHint}>Guarda puntos frecuentes con nombres claros. Despues, al pedir delivery, usaremos esa direccion sin pedirte los datos otra vez.</Text>
+              <Text style={styles.accountHint}>Guarda puntos frecuentes con nombres claros. Después, al pedir delivery, usaremos esa dirección sin pedirte los datos otra vez.</Text>
               {!profileComplete ? <Text style={styles.submitError}>Primero guarda nombre, telefono y carnet para asociar direcciones a tu cuenta.</Text> : null}
               {errorMessage ? <Text style={styles.submitError}>{errorMessage}</Text> : null}
               {successMessage ? <Text style={styles.successInline}>{successMessage}</Text> : null}
@@ -4146,19 +4172,20 @@ function AccountScreen({
                   </View>
                 </View>
               )) : (
-                <EmptyMessage description="Agrega Casa, Trabajo u otro punto frecuente para pedir mas rapido." title="Aun no tienes direcciones" />
+                <EmptyMessage description="Agrega Casa, Trabajo u otro punto frecuente para pedir más rápido." title="Aún no tienes direcciones" />
               )}
             </View>
           </>
         ) : panelView === "orders" ? (
           <>
+            {orderFilter === "all" ? <AccountActiveOrders orders={customerStore.recentOrders} onOpen={onOpenRecentOrder} /> : null}
             <View style={styles.accountCard}>
 
-              <Text style={styles.accountHint}>Revisa tus pedidos y abre el seguimiento de los que están en curso.</Text>
+              <Text style={styles.accountHint}>Consulta tus pedidos y abre el seguimiento en tiempo real de los que están en curso.</Text>
               <View style={styles.accountFilterRow}>
-                <OrderFilterChip active={orderFilter === "all"} label="Ultimos" onPress={() => setOrderFilter("all")} />
-                <OrderFilterChip active={orderFilter === "delivery"} label="Delivery" onPress={() => setOrderFilter("delivery")} />
-                <OrderFilterChip active={orderFilter === "pickup"} label="Recojo" onPress={() => setOrderFilter("pickup")} />
+                <OrderFilterChip active={orderFilter === "all"} label="Todos" onPress={() => setOrderFilter("all")} />
+                <OrderFilterChip active={orderFilter === "active"} label="En curso" onPress={() => setOrderFilter("active")} />
+                <OrderFilterChip active={orderFilter === "completed"} label="Finalizados" onPress={() => setOrderFilter("completed")} />
               </View>
             </View>
 
@@ -4171,6 +4198,7 @@ function AccountScreen({
                   <View style={styles.recentOrderBody}>
                     <Text numberOfLines={1} style={styles.recentOrderName}>{order.restaurantName}</Text>
                     <Text style={styles.recentOrderMeta}>{order.orderNumber} | {formatBs(order.total)}</Text>
+                    <Text style={styles.accountOrderDate}>{recentOrderDateLabel(order.createdAt)}</Text>
                   </View>
                   <View style={styles.accountOrderTrailing}>
                     <View style={[styles.accountOrderStatus, order.status === "cancelled" && styles.accountOrderStatusCancelled]}>
@@ -4183,7 +4211,7 @@ function AccountScreen({
                   <ArrowRight color={colors.blue} size={18} strokeWidth={3} />
                 </Pressable>
               )) : (
-                <EmptyMessage description="Cuando confirmes un pedido aparecera aqui con acceso al seguimiento." title="Sin pedidos en este filtro" />
+                <EmptyMessage description={orderFilter === "active" ? "Cuando un local confirme tu pedido aparecerá aquí con acceso al seguimiento." : orderFilter === "completed" ? "Los pedidos entregados o cancelados aparecerán aquí." : "Cuando confirmes un pedido aparecerá aquí con acceso al seguimiento."} title="Sin pedidos en este filtro" />
               )}
             </View>
           </>
@@ -4191,7 +4219,7 @@ function AccountScreen({
           <>
             <View style={styles.accountCard}>
 
-              <Text style={styles.accountHint}>Tus locales y platos guardados quedan disponibles aqui para volver a ellos rapidamente.</Text>
+              <Text style={styles.accountHint}>Tus locales y platos guardados quedan disponibles aquí para volver a ellos rápidamente.</Text>
               <View style={styles.accountFilterRow}>
                 <OrderFilterChip active={favoriteFilter === "all"} label="Todos" onPress={() => setFavoriteFilter("all")} />
                 <OrderFilterChip active={favoriteFilter === "restaurant"} label="Locales" onPress={() => setFavoriteFilter("restaurant")} />
@@ -4210,7 +4238,7 @@ function AccountScreen({
                   <FavoriteButton active onPress={() => onToggleFavorite(favorite)} />
                 </Pressable>
               )) : (
-                <EmptyMessage description="Toca el corazon de un local o plato para guardarlo aqui." title="Sin favoritos en este filtro" />
+                <EmptyMessage description="Toca el corazón de un local o plato para guardarlo aquí." title="Sin favoritos en este filtro" />
               )}
             </View>
           </>
@@ -6640,6 +6668,8 @@ const styles = StyleSheet.create({
   accountSafe: { flex: 1, backgroundColor: "#F7F9FC" },
   accountTopBar: { flexDirection: "row", alignItems: "center", gap: 12, paddingVertical: 14 },
   accountTopBarHome: { minHeight: 62, paddingBottom: 6 },
+  accountTopActions: { alignItems: "center", flexDirection: "row", gap: 8 },
+  accountNotificationDot: { backgroundColor: colors.green, borderColor: "#FFFFFF", borderRadius: 999, borderWidth: 2, height: 10, position: "absolute", right: 7, top: 7, width: 10 },
   accountHeaderButton: { minHeight: 44, minWidth: 44, alignItems: "center", justifyContent: "center", borderRadius: 22, backgroundColor: "#EEF3F8" },
   accountTopEyebrow: { color: colors.blue, fontSize: 19, fontWeight: "900", letterSpacing: -0.8 },
   accountTopTitle: { color: colors.blue, fontSize: 27, fontWeight: "800", marginTop: 4 },
@@ -6705,6 +6735,7 @@ const styles = StyleSheet.create({
   accountName: { color: colors.ink, fontSize: 18, fontWeight: "900" },
   accountOrderRow: { alignItems: "center", backgroundColor: colors.background, borderColor: colors.border, borderRadius: 18, borderWidth: 1, flexDirection: "row", gap: 10, padding: 11 },
   accountOrderMode: { color: colors.muted, fontSize: 10, fontWeight: "800" },
+  accountOrderDate: { color: colors.muted, fontSize: 10, fontWeight: "700", marginTop: 4 },
   accountOrderStatus: { backgroundColor: "#F3FFE0", borderColor: colors.green, borderRadius: 999, borderWidth: 1, paddingHorizontal: 8, paddingVertical: 4 },
   accountOrderStatusCancelled: { backgroundColor: "#FFF1F3", borderColor: "#FECDD3" },
   accountOrderStatusText: { color: colors.blue, fontSize: 10, fontWeight: "900" },
